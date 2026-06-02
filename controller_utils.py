@@ -94,7 +94,6 @@ class sparse_row_norm(torch.autograd.Function):
         return csc_scipy_to_torch(csc_matrix(dN)), None
 
 
-# TODO : note these functions are not optimized, but for the problems that are computationally feasible, these seem to be fine
 class sparse_row_normalize(torch.autograd.Function):
     '''
     Differentiate sparse row normalization. Insane this is not supported...
@@ -536,82 +535,9 @@ def assign_line_limits(naza_list, line_max_vals, line_min_vals):
 
     with torch.no_grad():
         for i in range(len(naza_list)):
-            line_max = line_max_vals[i]
-            line_min = line_min_vals[i]
-            line_max_change = torch.cat([line_max[:1], torch.diff(line_max, dim=0)], dim=0)
-            line_min_change = torch.cat([line_min[:1], torch.diff(line_min, dim=0)], dim=0)
             naza = naza_list[i]
             naza.line_max_change = nn.Parameter(line_max_vals.clone())
             naza.line_min_change = nn.Parameter(line_min_vals.clone())
-
-
-def get_next_action_debug(grid, naza_list, disturbances, t, dQP_layer, verbose=False, with_cvxpy=False, update_state=False):
-    """
-    Collects actions from all agents for the next prediction window, aggregates them into one single action to be taken
-    on the entire grid.
-
-    Args:
-        grid (Grid):
-            Full grid that the NAZAs act on.
-        naza_list (List of Split_Constraint_NAZA objects):
-            List of all NAZAs on the grid.
-        disturbances (Torch tensor of shape (H, num_buses)):
-            Predictions of power injection noise at each bus in the NAZA control area.
-        t (int):
-            Current timestep.
-        update_state (bool):
-            True if NAZA should update its own state as if the actions solved for are actually taken.
-    Returns:
-        pred_actions_curt (Torch tensor of shape (H, grid.num_curt)):
-            Curtailment actions to be taken across the grid, aggregated across all NAZAs.
-        pred_actions_batt (Torch tensor of shape (H, grid.num_batt)):
-            Battery actions to be taken across the grid, aggregated across all NAZAs.
-        pred_line_max_slacks (Torch tensor of shape (num_agents, H, grid.num_lines)):
-            Each agent's predictions for the line max slack variables it would set along the horizon.
-        pred_line_min_slacks (Torch tensor of shape (num_agents, H, grid.num_lines)):
-            Each agent's predictions for the line min slack variables it would set along the horizon.
-        pred_bus_slacks (Torch tensor of shape (H, 2*(2*grid.num_batt + grid.num_curt))):
-            Aggregated bus slack variables (not including splits) across all agents.
-    """
-    start_next_action = time.time()
-    H = naza_list[0].H
-    pred_actions_curt = torch.zeros(H, grid.num_curt)
-    pred_actions_batt = torch.zeros(H, grid.num_batt)
-    num_agents = len(naza_list)
-    pred_bus_slacks = torch.zeros(H, 2*(2*grid.num_batt + grid.num_curt))
-    pred_line_max_slacks = torch.zeros(num_agents, H, grid.num_lines)
-    pred_line_min_slacks = torch.zeros(num_agents, H, grid.num_lines)
-
-    Q = []
-    q = []
-    G = []
-    h = []
-    A = []
-    b = []
-
-    for i in range(num_agents):
-        naza = naza_list[i]
-        naza_disturbances = disturbances[:, naza.buses_in_area]
-        config = naza.get_matrices(naza_disturbances, t)
-        Q.append(config["Q"])
-        q.append(config["q"])
-        G.append(config["G"])
-        h.append(config["h"])
-        A.append(config["A"])
-        b.append(config["b"])
-    # print(f"forming matrices takes time {time.time() - start_next_action}")
-    dqp_run = time.time()
-    results = dQP_layer(Q, q, G, h, t, A=A, b=b)
-    # print(f"dqp run takes time {time.time() - dqp_run}")
-    
-    # interpret = time.time()
-    z_list = list()
-    for i in range(num_agents):
-        naza = naza_list[i]
-        z = results[0][i]
-        z_list.append(z.flatten())
-        
-    return z_list
 
 
 def get_next_action(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False, with_cvxpy=False, update_state=False):
@@ -642,7 +568,6 @@ def get_next_action(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False
         pred_bus_slacks (Torch tensor of shape (H, 2*(2*grid.num_batt + grid.num_curt))):
             Aggregated bus slack variables (not including splits) across all agents.
     """
-    start_next_action = time.time()
     H = naza_list[0].H
     pred_actions_curt = torch.zeros(H, grid.num_curt)
     pred_actions_batt = torch.zeros(H, grid.num_batt)
@@ -699,7 +624,7 @@ def get_next_action(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False
     return pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks
 
 
-def get_next_action_base_dQPTH(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False, with_cvxpy=False, update_state=False):
+def get_next_action_base(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False, with_cvxpy=False, update_state=False):
     """
     Collects actions from all agents for the next prediction window, aggregates them into one single action to be taken
     on the entire grid.
@@ -778,54 +703,6 @@ def get_next_action_base_dQPTH(grid, naza_list, disturbances, t, dQPTH_layer, ve
             pred_actions_batt[:,naza.batt_idx] = actions_batt
     except Exception as e:
         print(e)
-    return pred_actions_curt, pred_actions_batt, None, None, None
-
-
-def get_next_action_base_cvxpy(grid, naza_list, disturbances, t, verbose=False, update_state=False):
-    """
-    Collects actions from all agents for the next prediction window, aggregates them into one single action to be taken
-    on the entire grid. Each agent computes actions using cvxpy.
-
-    Args:
-        grid (Grid):
-            Full grid that the NAZAs act on.
-        naza_list (List of Base_NAZA objects):
-            List of all NAZAs on the grid.
-        disturbances (Torch tensor of shape (H, num_buses)):
-            Predictions of power injection noise at each bus in the NAZA control area.
-        t (int):
-            Current timestep.
-        update_state (bool):
-            True if NAZA should update its own state as if the actions solved for are actually taken.
-            
-    Returns:
-        pred_actions_curt (Torch tensor of shape (H, grid.num_curt)):
-            Curtailment actions to be taken across the grid, aggregated across all NAZAs.
-        pred_actions_batt (Torch tensor of shape (H, grid.num_batt)):
-            Battery actions to be taken across the grid, aggregated across all NAZAs.
-        pred_line_max_slacks (Torch tensor of shape (num_agents, H, grid.num_lines)):
-            Each agent's predictions for the line max slack variables it would set along the horizon.
-        pred_line_min_slacks (Torch tensor of shape (num_agents, H, grid.num_lines)):
-            Each agent's predictions for the line min slack variables it would set along the horizon.
-        pred_bus_slacks (Torch tensor of shape (H, 2*grid.slack_dim)):
-            Aggregated bus slack variables (not including splits) across all agents.
-    """
-    H = naza_list[0].H
-    pred_actions_curt = torch.zeros(H, grid.num_curt)
-    pred_actions_batt = torch.zeros(H, grid.num_batt)
-    num_agents = len(naza_list)
-    pred_bus_slacks = torch.zeros(H, 2*(2*grid.num_batt + grid.num_curt))
-    num_agents = len(naza_list)
-
-    for i in range(num_agents):
-        naza = naza_list[i]
-        naza_disturbances = disturbances[:, naza.buses_in_area]
-        bus_states, line_states, actions_curt, actions_batt, bus_slacks, line_max_slacks, line_min_slacks, objective = \
-        naza.make_decision(naza_disturbances, t, verbose=verbose, update_state=update_state)
-        # print(f"pred objective agent {i+1}: {objective}")
-        pred_actions_curt[:,naza.curt_idx] = actions_curt
-        pred_actions_batt[:,naza.batt_idx] = actions_batt
-
     return pred_actions_curt, pred_actions_batt, None, None, None
 
 

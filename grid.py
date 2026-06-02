@@ -1,6 +1,5 @@
 import torch
 
-
 class Grid:
     """Captures grid state and dynamics
 
