@@ -2,10 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import cvxpy as cp
-
 import time
-import qpth
 
 torch.set_default_dtype(torch.double)
 np.random.seed(0)
@@ -429,132 +426,6 @@ class Base_Controller(nn.Module):
             None
         """
         self.bus_state = self.grid.state[self.grid_state_bus_state_idx]
-
-
-    def make_decision(self, disturbances, t, verbose=False, solver="OSQP", update_state=False):
-        """
-        Agent makes a decision completely ignoring the impacts of other agents, and also ignoring its effects on other
-        areas.
-
-        Args:
-            disturbances (Torch tensor of shape (H, num_buses)):
-                Predictions of power injection noise at each bus in the controller's designated area.
-            t:
-                Unused, keeping it to keep function signature the same for inherited class.
-            verbose (bool):
-                Optional arg. True if QPTH output should be printed to terminal.
-            solver (String):
-                Specifies which CVXPY solver to use, options are:
-                - "OSQP"
-                - "MOSEK"
-                - "ECOS"
-                - "SCS"
-        Returns:
-            states (Torch tensor of shape (H, state_dim)):
-                Next H predicted states based on this controller's localized dynamics.
-            line_states (Torch tensor of shape (H, grid.num_lines)):
-                Next H predicted cumulative net impacts on all grid lines.
-            actions_curt (Torch tensor of shape (H, num_curt)):
-                Next H curtailment actions.
-            actions_batt (Torch tensor of shape (H, num_batt)):
-                Next H battery actions.
-            bus_slacks (Torch tensor of shape (H, slack_dim)):
-                Next H bus slack values.
-            line_max_slacks (Torch tensor of shape (H, grid.num_lines)):
-                Next H slack values on line max.
-            line_min_slacks (Torch tensor of shape (H, grid.num_lines)):
-                Next H slack values on line min.
-        """
-        init_bus_state = self.bus_state.detach()
-        init_line_state = self.line_state.detach()
-
-        bus_states = [cp.Variable(self.bus_state_dim) for _ in range(self.H+1)]
-        line_states = [cp.Variable(self.num_lines) for _ in range(self.H+1)]
-        actions_curt = [cp.Variable(self.num_curt) for _ in range(self.H)]
-        actions_batt = [cp.Variable(self.num_batt) for _ in range(self.H)]
-        line_max_slacks = [cp.Variable(self.num_lines, nonneg=True) for _ in range(self.H)]
-        line_min_slacks = [cp.Variable(self.num_lines, nonneg=True) for _ in range(self.H)]
-
-        objective = 0
-        constraints = []
-        constraints.append(bus_states[0] == init_bus_state)
-        constraints.append(line_states[0] == init_line_state)
-
-        for i in range(self.H):
-            constraints.append(bus_states[i+1] == self.bus_A @ bus_states[i] + self.bus_B_curt @ actions_curt[i] \
-                               + self.bus_B_batt @ actions_batt[i])
-            constraints.append(line_states[i+1] == line_states[i] + self.line_B_curt @ actions_curt[i] \
-                               + self.line_B_batt @ actions_batt[i] + self.line_B_noise @ disturbances[i,:])
-            constraints.append(self.H_x @ bus_states[i+1] <= self.H_limit)
-            constraints.append(line_states[i+1] <= self.line_upper_limits + line_max_slacks[i])
-            constraints.append(line_states[i+1] >= self.line_lower_limits - line_min_slacks[i])
-
-        self.target_charges = self.grid.target_batt_charges[self.batt_idx]
-        for i in range(self.H):
-            objective += self.batt_cost * cp.sum_squares(bus_states[i+1][self.bus_state_batt_charge_idx] - self.target_charges)
-            objective += self.curt_change_cost * cp.sum_squares(actions_curt[i])
-            objective += self.curt_net_cost * cp.sum_squares(bus_states[i+1][self.bus_state_curt_idx])
-            objective += self.line_slack_cost * cp.sum_squares(line_max_slacks[i])
-            objective += self.line_slack_cost * cp.sum_squares(line_min_slacks[i])
-
-        for i in range(self.H+1):
-            objective += self.eps * cp.sum_squares(bus_states[i])
-            objective += self.eps * cp.sum_squares(line_states[i])
-        for i in range(self.H):
-            objective += self.eps * cp.sum_squares(actions_curt[i])
-            objective += self.eps * cp.sum_squares(actions_batt[i])
-            objective += self.eps * cp.sum_squares(line_max_slacks[i])
-            objective += self.eps * cp.sum_squares(line_min_slacks[i])
-
-        problem = cp.Problem(cp.Minimize(objective), constraints)
-
-        if solver.lower() == "osqp":
-            problem.solve(verbose=verbose,
-                        solver=cp.OSQP,
-                        max_iter=20000)
-        elif solver.lower() == "mosek":
-            problem.solve(verbose=verbose,
-                        solver=cp.MOSEK,
-                        mosek_params={
-                            'MSK_IPAR_LOG': 10,
-                            'MSK_IPAR_INTPNT_MAX_ITERATIONS': 1000000,  # Interior-point max iterations
-                            'MSK_IPAR_SIM_MAX_ITERATIONS': 1000000,      # Simplex max iterations (if used)
-                        }
-                        )
-        elif solver.lower() == "ecos":
-            problem.solve(verbose=verbose,
-                          abstol=1e-8,
-                          feastol=1e-8,
-                          reltol=1e-8,
-                          solver=cp.ECOS)
-        elif solver.lower() == "scs":
-            problem.solve(verbose=verbose,
-                          eps=1e-8,
-                        solver=cp.SCS)
-
-        opt_bus_states = torch.zeros(self.H, self.bus_state_dim)
-        opt_line_states = torch.zeros(self.H, self.num_lines)
-        opt_actions_curt = torch.zeros(self.H, self.num_curt)
-        opt_actions_batt = torch.zeros(self.H, self.num_batt)
-        opt_line_max_slacks = torch.zeros(self.H, self.num_lines)
-        opt_line_min_slacks = torch.zeros(self.H, self.num_lines)
-
-        for i in range(self.H):
-            opt_bus_states[i,:] = torch.tensor(bus_states[i+1].value)
-            opt_line_states[i,:] = torch.tensor(line_states[i+1].value)
-            opt_actions_curt[i,:] = torch.tensor(actions_curt[i].value)
-            opt_actions_batt[i,:] = torch.tensor(actions_batt[i].value)
-            opt_line_max_slacks[i,:] = torch.tensor(line_max_slacks[i].value)
-            opt_line_min_slacks[i,:] = torch.tensor(line_min_slacks[i].value)
-
-        optimal_value = objective.value
-
-        if update_state:
-            self.bus_state = opt_bus_states[0]
-            self.line_state = opt_line_states[0]
-
-        return opt_bus_states, opt_line_states, opt_actions_curt, opt_actions_batt, None, opt_line_max_slacks, \
-               opt_line_min_slacks, optimal_value
 
 
     def get_matrices_dQPTH(self, disturbances, t):
