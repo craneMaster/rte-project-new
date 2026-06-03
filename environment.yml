@@ -20,4 +20,5 @@ dependencies:
       - gurobipy==12.0.3
       - mosek==11.0.29
       - qdldl==0.1.7.post5
+      - qpth==0.0.18
       - tqdm==4.67.1

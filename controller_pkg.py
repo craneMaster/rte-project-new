@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import qpth
 import time
 
 torch.set_default_dtype(torch.double)
