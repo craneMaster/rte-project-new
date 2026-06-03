@@ -19,6 +19,7 @@ parent_dir = os.path.dirname(src_dir)
 sys.path.append(parent_dir)
 
 from dQPTH_helpers.set_solver_tolerance import set_solver_tolerance
+from dQPTH_helpers.gurobi_ws import gurobi_solve_problem as gurobi_ws_solve_problem
 
 import dQPTH_helpers.sparse_helper as sparse_helper
 import dQPTH_helpers.lin_solvers as lin_solvers
@@ -370,13 +371,18 @@ def call_qp_solver_pool_target(qp_solver_keywords, kwargs_main):
     Worker function for the multiprocessing pool.
     Returns results (numpy arrays/lists) which the pool gathers.
     """
-    # Note: We combine qp_solver_keywords and kwargs_main here
-    full_kwargs = dict(**kwargs_main, **qp_solver_keywords)
+    if kwargs_main.get("solver") == "gurobi":
+        solution, bases = gurobi_ws_solve_problem(
+            problem=kwargs_main["problem"],
+            initvals=kwargs_main.get("initvals"),
+            verbose=kwargs_main.get("verbose", False),
+            **qp_solver_keywords,
+        )
+    else:
+        full_kwargs = dict(**kwargs_main, **qp_solver_keywords)
+        solution = qpsolvers.solve_problem(**full_kwargs)
+        bases = (None, None)
 
-    solution, bases = qpsolvers.solve_problem(**full_kwargs)
-
-    # Return results as standard Python objects (numpy arrays/lists)
-    # The pool handles pickling these back to the main process
     return solution.x, solution.y, solution.z, bases[0], bases[1]
 
 

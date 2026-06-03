@@ -546,7 +546,7 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
                 start_time = time.time()
                 (total_loss / actual_batch_size).backward()
                 print(f"backward pass for one traj takes time {time.time() - start_time}")
-                # print(f"forward pass takes time {time.time() - start_time}")
+                
 
                 print(total_loss, total_train_loss)
 

@@ -467,11 +467,8 @@ def get_next_action(grid, controller_list, disturbances, t, dQPTH_layer, verbose
         scipy_Q.append(config["scipy_scaled_Q"])
         scipy_G.append(config["scipy_scaled_G"])
         scipy_A.append(config["scipy_scaled_A"])
-    try:
-        results = dQPTH_layer(Q, q, G, non_sparse_G, h, A, b, scipy_Q, scipy_G, scipy_A, t)
-    except Exception as e:
-        print("Following error occurred when calling dQPTH_layer:")
-        print(e)
+
+    results = dQPTH_layer(Q, q, G, non_sparse_G, h, A, b, scipy_Q, scipy_G, scipy_A, t)
     try:
         for i in range(num_agents):
             controller = controller_list[i]
