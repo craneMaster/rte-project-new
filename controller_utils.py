@@ -1,15 +1,5 @@
-"""
-Filename: NAZA_utils.py
-Author: James Chen
-Date Created: 2025-07-29
-
-Version History:
-----------------
-7/29/25 - Created file from RTE_utils.py
-9/16/25 - Edited to work with NAZA_QPTH, missing a lot of version history updates oops
-"""
-import grid
-import controller as NAZA
+import grid_pkg
+import controller_pkg
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,7 +18,6 @@ def csc_torch_to_scipy(A):
 
 def csc_scipy_to_torch(A):
     return torch.sparse_csc_tensor(torch.tensor(A.indptr,dtype=torch.int64),torch.tensor(A.indices,dtype=torch.int64),torch.tensor(A.data),size=np.shape(A),dtype=torch.float64)
-
 
 def coo_torch_to_scipy(A):
     # A must be coalesced
@@ -129,8 +118,8 @@ class sparse_row_normalize(torch.autograd.Function):
 
         return torch.tensor(dA_norm, dtype=torch.float64), torch.tensor(dN, dtype=torch.float64)
 
-def test_normalization():
 
+def test_normalization():
     # p = 2
     p = 1
 
@@ -260,135 +249,15 @@ def get_iid_noise_values(T, H, num_buses, max_noise, max_trend=0):
     return trend_values + noise_values
 
 
-def solve_NAZA(naza, noise, t, solver="MOSEK", verbose=False):
+def create_base_controllers(grid, num_controllers, partition, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost):
     """
-    Performs NAZA forward pass with a particular solver. We do this since CvxpyLayers only works with ECOS or SCS.
-
-    Args:
-        naza (Split_Constraint_NAZA):
-            NAZA controller.
-        disturbances (Torch tensor of shape (H, num_buses)):
-            Predictions of power injection noise at each bus in the NAZA control area.
-        t (int):
-            Current timestep.
-        solver (String):
-            Specifies which CVXPY solver to use, options are:
-            - "OSQP"
-            - "MOSEK"
-    Returns:
-            states (Torch tensor of shape (H, state_dim)):
-                Next H predicted states based on this NAZA's localized dynamics.
-            net_impacts (Torch tensor of shape (H, grid.num_lines)):
-                Next H predicted cumulative net impacts on all grid lines.
-            actions_curt (Torch tensor of shape (H, num_curt)):
-                Next H curtailment actions.
-            actions_batt (Torch tensor of shape (H, num_batt)):
-                Next H battery actions.
-            bus_slacks (Torch tensor of shape (H, slack_dim)):
-                Next H bus slack values on H_limit.
-            line_max_slacks (Torch tensor of shape (H, grid.num_lines)):
-                Next H line max slack values.
-            line_min_slacks (Torch tensor of shape (H, grid.num_lines)):
-                Next H line min slack values.
-    """
-    init_state = naza.state.detach()
-    init_net_impact = naza.net_impact.detach()
-    line_max = naza.line_max[t:t+naza.H,:].detach()
-    line_min = naza.line_min[t:t+naza.H,:].detach()
-
-    states = [cp.Variable(naza.state_dim) for _ in range(naza.H+1)]
-    net_impacts = [cp.Variable(naza.grid.num_lines) for _ in range(naza.H+1)]
-    actions_curt = [cp.Variable(naza.num_curt) for _ in range(naza.H)]
-    actions_batt = [cp.Variable(naza.num_batt) for _ in range(naza.H)]
-    bus_slacks = [cp.Variable(naza.bus_slack_dim, nonneg=True) for _ in range(naza.H)]
-    line_max_slacks = [cp.Variable(naza.grid.num_lines, nonneg=True) for _ in range(naza.H)]
-    line_min_slacks = [cp.Variable(naza.grid.num_lines, nonneg=True) for _ in range(naza.H)]
-
-    objective = 0
-    constraints = []
-    constraints.append(states[0] == init_state)
-    constraints.append(net_impacts[0] == init_net_impact)
-
-    for i in range(naza.H):
-        constraints.append(states[i+1] == naza.A @ states[i] + naza.B_curt @ actions_curt[i] \
-                            + naza.B_batt @ actions_batt[i] + naza.B_noise @ noise[i,:])
-        constraints.append(net_impacts[i+1] == net_impacts[i] + naza.net_impact_B_curt @ actions_curt[i] \
-                            + naza.net_impact_B_batt @ actions_batt[i] + naza.net_impact_B_noise @ noise[i,:])
-        constraints.append(naza.H_x @ states[i+1][naza.num_lines:] <= naza.H_limit + bus_slacks[i])
-        constraints.append(net_impacts[i+1] <= line_max[i] + line_max_slacks[i])
-        constraints.append(net_impacts[i+1] >= line_min[i] - line_min_slacks[i])
-
-    state_batt_charge_idx = slice(naza.num_lines, naza.num_lines + naza.num_batt)
-    state_curt_idx = slice(naza.num_lines + 2*naza.num_batt, naza.num_lines + 2*naza.num_batt + naza.num_curt)
-
-    naza_target_charges = naza.grid.target_batt_charges[naza.batt_idx]
-    for i in range(naza.H):
-        objective += cp.quad_form(states[i+1][state_batt_charge_idx] - naza_target_charges, naza.batt_cost * torch.eye(naza.num_batt))
-        objective += naza.curt_change_cost * cp.sum_squares(actions_curt[i])
-        objective += naza.curt_change_cost * cp.sum_squares(actions_batt[i])
-        objective += naza.curt_net_cost * cp.sum_squares(states[i+1][state_curt_idx])
-        objective += naza.slack_cost * cp.sum_squares(bus_slacks[i])
-        objective += naza.slack_cost * cp.sum_squares(line_max_slacks[i])
-        objective += naza.slack_cost * cp.sum_squares(line_min_slacks[i])
-
-    problem = cp.Problem(cp.Minimize(objective), constraints)
-
-    if solver.lower() == "osqp":
-        problem.solve(verbose=verbose,
-                    solver=cp.OSQP,
-                    eps_abs=1e-8,
-                    eps_rel=1e-8,
-                    max_iter=20000,
-                    warm_start=True,
-                    polish=True)
-    elif solver.lower() == "mosek":
-        problem.solve(verbose=verbose,
-                      solver=cp.MOSEK,
-                      mosek_params={
-                        'MSK_IPAR_LOG': 10,
-                        'MSK_IPAR_INTPNT_MAX_ITERATIONS': 1000000,  # Interior-point max iterations
-                        'MSK_IPAR_SIM_MAX_ITERATIONS': 1000000,      # Simplex max iterations (if used)
-                      }
-                    )
-    elif solver.lower() == "ecos":
-        problem.solve(verbose=verbose,
-                      solver=cp.ECOS)
-    elif solver.lower() == "scs":
-        problem.solve(verbose=verbose,
-                      solver=cp.SCS)
-
-    # print("Status:", problem.status)
-
-    opt_states = torch.zeros(naza.H, naza.state_dim)
-    opt_net_impacts = torch.zeros(naza.H, naza.grid.num_lines)
-    opt_actions_curt = torch.zeros(naza.H, naza.num_curt)
-    opt_actions_batt = torch.zeros(naza.H, naza.num_batt)
-    opt_bus_slacks = torch.zeros(naza.H, naza.bus_slack_dim)
-    opt_line_max_slacks = torch.zeros(naza.H, naza.grid.num_lines)
-    opt_line_min_slacks = torch.zeros(naza.H, naza.grid.num_lines)
-
-    # print(type(states[i].value))
-    for i in range(naza.H):
-        opt_states[i,:] = torch.tensor(states[i].value)
-        opt_net_impacts[i,:] = torch.tensor(net_impacts[i].value)
-        opt_actions_curt[i,:] = torch.tensor(actions_curt[i].value)
-        opt_actions_batt[i,:] = torch.tensor(actions_batt[i].value)
-        opt_bus_slacks[i,:] = torch.tensor(bus_slacks[i].value)
-        opt_line_max_slacks[i,:] = torch.tensor(line_max_slacks[i].value)
-        opt_line_min_slacks[i,:] = torch.tensor(line_min_slacks[i].value)
-
-    return opt_states, opt_net_impacts, opt_actions_curt, opt_actions_batt, opt_bus_slacks, opt_line_max_slacks, opt_line_min_slacks, objective.value
-
-
-def create_base_nazas(grid, num_nazas, partition, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost):
-    """
-    Initializes base NAZA agents on a given grid given a desired partition of buses.
+    Initializes base controller agents on a given grid given a desired partition of buses.
 
     Args:
         grid (Grid):
             Full grid that the agents act on.
-        num_nazas (int):
-            Number of split constraint NAZAs on the grid.
+        num_controllers (int):
+            Number of split constraint controllers on the grid.
         partition (list of lists):
             Set of buses that each agent controls, agent i controls buses in partition[i]
         T (int):
@@ -404,14 +273,14 @@ def create_base_nazas(grid, num_nazas, partition, T, H, batt_cost, curt_change_c
         slack_cost (Double):
             Slack penalty. Must be non-negative.
     Returns:
-        naza_list: (list of Base_NAZA objects) agents fully initialized, in the order matching the partition
+        controller_list: (list of Base_Controller objects) agents fully initialized, in the order matching the partition
     Raises:
         ValueError: If the number of partitions does not match the number of agents.
         ValueError: If the partition is not a valid partition of the grid.
         ValueError: If costs are negative.
     """
-    if not len(partition) == num_nazas:
-        raise ValueError(f"Number of partitions {len(partition)} does not match number of agents {num_nazas}")
+    if not len(partition) == num_controllers:
+        raise ValueError(f"Number of partitions {len(partition)} does not match number of agents {num_controllers}")
     if not is_partition(partition, [i for i in range(grid.num_buses)]):
         raise ValueError(f"Partition is not a valid partition of the grid")
     if curt_change_cost < 0:
@@ -419,25 +288,25 @@ def create_base_nazas(grid, num_nazas, partition, T, H, batt_cost, curt_change_c
     if curt_net_cost < 0:
         raise ValueError(f"init_curt_net_cost {curt_net_cost} is negative.")
 
-    naza_list = list()
-    for i in range(num_nazas):
+    controller_list = list()
+    for i in range(num_controllers):
         buses_in_area = torch.tensor(partition[i], dtype=torch.int)
-        naza_list.append(NAZA.Base_NAZA(grid, H, buses_in_area, batt_cost, curt_change_cost, curt_net_cost,
+        controller_list.append(controller_pkg.Base_Controller(grid, H, buses_in_area, batt_cost, curt_change_cost, curt_net_cost,
                                         bus_slack_cost, line_slack_cost))
         
-    return naza_list
+    return controller_list
 
 
-def create_split_constraint_nazas(grid, num_nazas, partition, T, H, batt_cost, curt_change_cost, curt_net_cost,
-                                  bus_slack_cost, line_slack_cost, active_eps=1e-5):
+def create_split_constraint_controllers(grid, num_controllers, partition, T, H, batt_cost, curt_change_cost, curt_net_cost,
+                                  bus_slack_cost, line_slack_cost):
     """
     Initializes split constraint agents on a given grid given a desired partition of buses.
 
     Args:
         grid (Grid):
             Full grid that the agents act on.
-        num_nazas (int):
-            Number of split constraint NAZAs on the grid.
+        num_controllers (int):
+            Number of split constraint controllers on the grid.
         partition (list of lists):
             Set of buses that each agent controls, agent i controls buses in partition[i]
         T (int):
@@ -454,17 +323,15 @@ def create_split_constraint_nazas(grid, num_nazas, partition, T, H, batt_cost, c
             Slack penalty on bus variables. Must be non-negative.
         line_slack_cost (Double):
             Slack penalty on line variables. Must be non-negative.
-        eps_abs (Double):
-            Tolerance to decide active set of constraints in dQP.
     Returns:
-        naza_list: (list of Split_Constraint_NAZA objects) agents full initialized, in the order matching the partition
+        controller_list: (list of Split_Constraint_Controller objects) agents full initialized, in the order matching the partition
     Raises:
         ValueError: If the number of partitions does not match the number of agents.
         ValueError: If the partition is not a valid partition of the grid.
         ValueError: If costs are negative.
     """
-    if not len(partition) == num_nazas:
-        raise ValueError(f"Number of partitions {len(partition)} does not match number of agents {num_nazas}")
+    if not len(partition) == num_controllers:
+        raise ValueError(f"Number of partitions {len(partition)} does not match number of agents {num_controllers}")
     if not is_partition(partition, [i for i in range(grid.num_buses)]):
         raise ValueError(f"Partition is not a valid partition of the grid")
     if curt_change_cost < 0:
@@ -472,27 +339,26 @@ def create_split_constraint_nazas(grid, num_nazas, partition, T, H, batt_cost, c
     if curt_net_cost < 0:
         raise ValueError(f"init_curt_net_cost {curt_net_cost} is negative.")
 
-    naza_list = list()
+    controller_list = list()
 
     max_margin = torch.zeros(T+H, grid.num_lines)
     min_margin = torch.zeros(T+H, grid.num_lines)
-    max_margin[0] = ( grid.line_data[:,5] - grid.init_state[0:grid.num_lines]) / num_nazas
-    min_margin[0] = (-grid.line_data[:,5] - grid.init_state[0:grid.num_lines]) / num_nazas
+    max_margin[0] = ( grid.line_data[:,5] - grid.init_state[0:grid.num_lines]) / num_controllers
+    min_margin[0] = (-grid.line_data[:,5] - grid.init_state[0:grid.num_lines]) / num_controllers
 
-    for i in range(num_nazas):
+    for i in range(num_controllers):
         buses_in_area = torch.tensor(partition[i], dtype=torch.int)
-        naza_list.append(NAZA.Split_Constraint_NAZA(grid, H, buses_in_area, max_margin, min_margin, batt_cost,
-                                                    curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
-                                                    eps_abs=active_eps))
-    return naza_list
+        controller_list.append(controller_pkg.Split_Constraint_Controller(grid, H, buses_in_area, max_margin, min_margin, batt_cost,
+                                                    curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost))
+    return controller_list
 
 
-def assign_line_limit_changes(naza_list, line_max_changes, line_min_changes):
+def assign_line_limit_changes(controller_list, line_max_changes, line_min_changes):
     """
-    Assigns the given line max/min changes to the NAZAs in the list.
+    Assigns the given line max/min changes to the controllers in the list.
     Args:
-        naza_list (list of SplitConstraintNAZA objects):
-            List of NAZAs whose line limits should be set.
+        controller_list (list of SplitConstraintcontroller objects):
+            List of controllers whose line limits should be set.
         line_max_changes (Torch tensor of shape (num_agents, T+H, grid.num_lines)):
             Changes between timesteps for line max limits each agent should adhere to over the trajectory.
         line_min_changes (Torch tensor of shape (num_agents, T+H, grid.num_lines)):
@@ -503,23 +369,23 @@ def assign_line_limit_changes(naza_list, line_max_changes, line_min_changes):
         ValueError: if number of agents does not coincide
     """
     num_agents = line_max_changes.shape[0]
-    if not len(naza_list) == num_agents:
-        raise ValueError(f"NAZA list has {len(naza_list)} NAZAs but line_max_vals has values for {num_agents} agents.")
+    if not len(controller_list) == num_agents:
+        raise ValueError(f"controller list has {len(controller_list)} controllers but line_max_vals has values for {num_agents} agents.")
 
     with torch.no_grad():
-        for i in range(len(naza_list)):
-            naza = naza_list[i]
-            naza.line_max_change = nn.Parameter(line_max_changes[i].clone())
-            naza.line_min_change = nn.Parameter(line_min_changes[i].clone())
+        for i in range(len(controller_list)):
+            controller = controller_list[i]
+            controller.line_max_change = nn.Parameter(line_max_changes[i].clone())
+            controller.line_min_change = nn.Parameter(line_min_changes[i].clone())
 
 
-def assign_line_limits(naza_list, line_max_vals, line_min_vals):
+def assign_line_limits(controller_list, line_max_vals, line_min_vals):
     """
-    Assigns the given line limits to the NAZAs in the list.
+    Assigns the given line limits to the controllers in the list.
 
     Args:
-        naza_list (list of SplitConstraintNAZA objects):
-            List of NAZAs whose line limits should be set.
+        controller_list (list of SplitConstraintcontroller objects):
+            List of controllers whose line limits should be set.
         line_max_vals (Torch tensor of shape (num_agents, T+H, grid.num_lines)):
             Line max limits each agent should adhere to over the trajectory.
         line_min_vals (Torch tensor of shape (num_agents, T+H, grid.num_lines)):
@@ -530,37 +396,37 @@ def assign_line_limits(naza_list, line_max_vals, line_min_vals):
         ValueError: if number of agents does not coincide
     """
     num_agents = line_max_vals.shape[0]
-    if not len(naza_list) == num_agents:
-        raise ValueError(f"NAZA list has {len(naza_list)} NAZAs but line_max_vals has values for {num_agents} agents.")
+    if not len(controller_list) == num_agents:
+        raise ValueError(f"controller list has {len(controller_list)} controllers but line_max_vals has values for {num_agents} agents.")
 
     with torch.no_grad():
-        for i in range(len(naza_list)):
-            naza = naza_list[i]
-            naza.line_max_change = nn.Parameter(line_max_vals.clone())
-            naza.line_min_change = nn.Parameter(line_min_vals.clone())
+        for i in range(len(controller_list)):
+            controller = controller_list[i]
+            controller.line_max_change = nn.Parameter(line_max_vals.clone())
+            controller.line_min_change = nn.Parameter(line_min_vals.clone())
 
 
-def get_next_action(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False, with_cvxpy=False, update_state=False):
+def get_next_action(grid, controller_list, disturbances, t, dQPTH_layer, verbose=False, with_cvxpy=False, update_state=False):
     """
     Collects actions from all agents for the next prediction window, aggregates them into one single action to be taken
     on the entire grid.
 
     Args:
         grid (Grid):
-            Full grid that the NAZAs act on.
-        naza_list (List of Split_Constraint_NAZA objects):
-            List of all NAZAs on the grid.
+            Full grid that the controllers act on.
+        controller_list (List of Split_Constraint_Controller objects):
+            List of all controllers on the grid.
         disturbances (Torch tensor of shape (H, num_buses)):
-            Predictions of power injection noise at each bus in the NAZA control area.
+            Predictions of power injection noise at each bus in the controller control area.
         t (int):
             Current timestep.
         update_state (bool):
-            True if NAZA should update its own state as if the actions solved for are actually taken.
+            True if controller should update its own state as if the actions solved for are actually taken.
     Returns:
         pred_actions_curt (Torch tensor of shape (H, grid.num_curt)):
-            Curtailment actions to be taken across the grid, aggregated across all NAZAs.
+            Curtailment actions to be taken across the grid, aggregated across all controllers.
         pred_actions_batt (Torch tensor of shape (H, grid.num_batt)):
-            Battery actions to be taken across the grid, aggregated across all NAZAs.
+            Battery actions to be taken across the grid, aggregated across all controllers.
         pred_line_max_slacks (Torch tensor of shape (num_agents, H, grid.num_lines)):
             Each agent's predictions for the line max slack variables it would set along the horizon.
         pred_line_min_slacks (Torch tensor of shape (num_agents, H, grid.num_lines)):
@@ -568,10 +434,10 @@ def get_next_action(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False
         pred_bus_slacks (Torch tensor of shape (H, 2*(2*grid.num_batt + grid.num_curt))):
             Aggregated bus slack variables (not including splits) across all agents.
     """
-    H = naza_list[0].H
+    H = controller_list[0].H
     pred_actions_curt = torch.zeros(H, grid.num_curt)
     pred_actions_batt = torch.zeros(H, grid.num_batt)
-    num_agents = len(naza_list)
+    num_agents = len(controller_list)
     pred_bus_slacks = torch.zeros(H, 2*(2*grid.num_batt + grid.num_curt))
     pred_line_max_slacks = torch.zeros(num_agents, H, grid.num_lines)
     pred_line_min_slacks = torch.zeros(num_agents, H, grid.num_lines)
@@ -588,9 +454,9 @@ def get_next_action(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False
     scipy_A = []
     
     for i in range(num_agents):
-        naza = naza_list[i]
-        naza_disturbances = disturbances[:, naza.buses_in_area]
-        config = naza.get_matrices_dQPTH(naza_disturbances, t)
+        controller = controller_list[i]
+        controller_disturbances = disturbances[:, controller.buses_in_area]
+        config = controller.get_matrices_dQPTH(controller_disturbances, t)
         Q.append(config["csc_scaled_Q"])
         q.append(config["q"])
         G.append(config["csc_scaled_G"])
@@ -608,43 +474,43 @@ def get_next_action(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False
         print(e)
     try:
         for i in range(num_agents):
-            naza = naza_list[i]
+            controller = controller_list[i]
             z = results[i]
             
             bus_states, line_states, actions_curt, actions_batt, bus_slacks, line_max_slacks, line_min_slacks, objective = \
-                naza.interpret_z(z.flatten(), update_state=update_state)
+                controller.interpret_z(z.flatten(), update_state=update_state)
 
-            pred_actions_curt[:,naza.curt_idx] = actions_curt
-            pred_actions_batt[:,naza.batt_idx] = actions_batt
+            pred_actions_curt[:,controller.curt_idx] = actions_curt
+            pred_actions_batt[:,controller.batt_idx] = actions_batt
             pred_line_max_slacks[i,:,:] = line_max_slacks
             pred_line_min_slacks[i,:,:] = line_min_slacks
-            # pred_bus_slacks[:,naza.bus_slack_idx] = bus_slacks
+            # pred_bus_slacks[:,controller.bus_slack_idx] = bus_slacks
     except Exception as e:
         print(e)
     return pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks
 
 
-def get_next_action_base(grid, naza_list, disturbances, t, dQPTH_layer, verbose=False, with_cvxpy=False, update_state=False):
+def get_next_action_base(grid, controller_list, disturbances, t, dQPTH_layer, verbose=False, with_cvxpy=False, update_state=False):
     """
     Collects actions from all agents for the next prediction window, aggregates them into one single action to be taken
     on the entire grid.
 
     Args:
         grid (Grid):
-            Full grid that the NAZAs act on.
-        naza_list (List of Split_Constraint_NAZA objects):
-            List of all NAZAs on the grid.
+            Full grid that the controllers act on.
+        controller_list (List of Split_Constraint_Controller objects):
+            List of all controllers on the grid.
         disturbances (Torch tensor of shape (H, num_buses)):
-            Predictions of power injection noise at each bus in the NAZA control area.
+            Predictions of power injection noise at each bus in the controller control area.
         t (int):
             Current timestep.
         update_state (bool):
-            True if NAZA should update its own state as if the actions solved for are actually taken.
+            True if controller should update its own state as if the actions solved for are actually taken.
     Returns:
         pred_actions_curt (Torch tensor of shape (H, grid.num_curt)):
-            Curtailment actions to be taken across the grid, aggregated across all NAZAs.
+            Curtailment actions to be taken across the grid, aggregated across all controllers.
         pred_actions_batt (Torch tensor of shape (H, grid.num_batt)):
-            Battery actions to be taken across the grid, aggregated across all NAZAs.
+            Battery actions to be taken across the grid, aggregated across all controllers.
         pred_line_max_slacks (Torch tensor of shape (num_agents, H, grid.num_lines)):
             Each agent's predictions for the line max slack variables it would set along the horizon.
         pred_line_min_slacks (Torch tensor of shape (num_agents, H, grid.num_lines)):
@@ -653,10 +519,10 @@ def get_next_action_base(grid, naza_list, disturbances, t, dQPTH_layer, verbose=
             Aggregated bus slack variables (not including splits) across all agents.
     """
     start_next_action = time.time()
-    H = naza_list[0].H
+    H = controller_list[0].H
     pred_actions_curt = torch.zeros(H, grid.num_curt)
     pred_actions_batt = torch.zeros(H, grid.num_batt)
-    num_agents = len(naza_list)
+    num_agents = len(controller_list)
     pred_bus_slacks = torch.zeros(H, 2*(2*grid.num_batt + grid.num_curt))
     pred_line_max_slacks = torch.zeros(num_agents, H, grid.num_lines)
     pred_line_min_slacks = torch.zeros(num_agents, H, grid.num_lines)
@@ -673,9 +539,9 @@ def get_next_action_base(grid, naza_list, disturbances, t, dQPTH_layer, verbose=
     scipy_A = []
     
     for i in range(num_agents):
-        naza = naza_list[i]
-        naza_disturbances = disturbances[:, naza.buses_in_area]
-        config = naza.get_matrices_dQPTH(naza_disturbances, t)
+        controller = controller_list[i]
+        controller_disturbances = disturbances[:, controller.buses_in_area]
+        config = controller.get_matrices_dQPTH(controller_disturbances, t)
         Q.append(config["csc_scaled_Q"])
         q.append(config["q"])
         G.append(config["csc_scaled_G"])
@@ -693,50 +559,50 @@ def get_next_action_base(grid, naza_list, disturbances, t, dQPTH_layer, verbose=
         print(e)
     try:
         for i in range(num_agents):
-            naza = naza_list[i]
+            controller = controller_list[i]
             z = results[i]
             
             bus_states, line_states, actions_curt, actions_batt, bus_slacks, line_max_slacks, line_min_slacks, objective = \
-                naza.interpret_z(z.flatten(), update_state=update_state)
+                controller.interpret_z(z.flatten(), update_state=update_state)
 
-            pred_actions_curt[:,naza.curt_idx] = actions_curt
-            pred_actions_batt[:,naza.batt_idx] = actions_batt
+            pred_actions_curt[:,controller.curt_idx] = actions_curt
+            pred_actions_batt[:,controller.batt_idx] = actions_batt
     except Exception as e:
         print(e)
     return pred_actions_curt, pred_actions_batt, None, None, None
 
 
-def reset_states(grid, naza_list):
+def reset_states(grid, controller_list):
     """
-    Resets all grid and NAZAs parameters to the values they had when originally initialized.
+    Resets all grid and controllers parameters to the values they had when originally initialized.
 
     Args:
         grid (Grid):
-            Full grid that the NAZAs act on.
-        naza_list (List of Split_Constraint_NAZA objects):
-            List of all NAZAs on the grid.
+            Full grid that the controllers act on.
+        controller_list (List of Split_Constraint_Controller objects):
+            List of all controllers on the grid.
     Returns:
         None
     """
     grid.reset_state()
-    for naza in naza_list:
-        naza.update_bus_state()
-        naza.reset_line_state()
+    for controller in controller_list:
+        controller.update_bus_state()
+        controller.reset_line_state()
 
 
-def update_naza_bus_states(naza_list):
+def update_controller_bus_states(controller_list):
     """
-    Updates bus states of all NAZAs in the list.
+    Updates bus states of all controllers in the list.
 
     Args:
-        naza_list (List of Split_Constraint_NAZA objects):
-            List of all NAZAs on the grid.
+        controller_list (List of Split_Constraint_Controller objects):
+            List of all controllers on the grid.
 
     Returns:
         None
     """
-    for naza in naza_list:
-        naza.update_bus_state()
+    for controller in controller_list:
+        controller.update_bus_state()
 
 
 def is_partition(partition, full_list):

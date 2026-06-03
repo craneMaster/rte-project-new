@@ -1,32 +1,18 @@
 import sys
 sys.path.append("../../")
 
-import os
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import torch.multiprocessing as mp
-from torch.autograd import Variable
-from torch.nn.parameter import Parameter
-import torchvision.datasets as dset
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-import cvxpy as cp
-import scipy as sc
 from tqdm import tqdm
-import pickle
-
-import matplotlib.pyplot as plt
-
-# from memory_profiler import profile
-
 import time
-from datetime import datetime
 
-import controller_utils as utils_dQPTH
+import grid_pkg
+import controller_pkg
+import controller_utils
 import dQPTH
+import evals
 
 torch.set_default_dtype(torch.double)
 torch.set_printoptions(threshold=10000)
@@ -71,17 +57,17 @@ def _step_scheduler(scheduler, loss):
         scheduler.step()
 
 
-def _project_params(naza_dqp_list, max_target_sum=0, min_target_sum=0):
+def _project_params(controller_dqp_list, max_target_sum=0, min_target_sum=0):
     """Project line_max/min_change so their sum across agents equals the target."""
-    n = len(naza_dqp_list)
+    n = len(controller_dqp_list)
     with torch.no_grad():
-        max_params = torch.stack([naza.line_max_change.data for naza in naza_dqp_list])
-        min_params = torch.stack([naza.line_min_change.data for naza in naza_dqp_list])
+        max_params = torch.stack([controller.line_max_change.data for controller in controller_dqp_list])
+        min_params = torch.stack([controller.line_min_change.data for controller in controller_dqp_list])
         max_correction = (max_params.sum(dim=0) - max_target_sum) / n
         min_correction = (min_params.sum(dim=0) - min_target_sum) / n
-        for naza in naza_dqp_list:
-            naza.line_max_change.data -= max_correction
-            naza.line_min_change.data -= min_correction
+        for controller in controller_dqp_list:
+            controller.line_max_change.data -= max_correction
+            controller.line_min_change.data -= min_correction
 
 
 # @profile
@@ -119,35 +105,32 @@ def get_central_full_traj(grid, T, H, disturbances, batt_cost, curt_change_cost,
     """
     partition = [[i for i in range(grid.num_buses)]]
     num_agents = 1
-    print("making naza")
-    start_time = time.time()
-    naza_dqp_list = utils_dQPTH.create_split_constraint_nazas(grid, num_agents, partition, T, T, batt_cost, curt_change_cost,
+    controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, T, T, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost, active_eps=1)
-    print(f"making NAZAs takes time {time.time() - start_time}")
     pool = mp.Pool(processes=num_agents)
     dqp_eps = 1e-3
     settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True, eps_active=dqp_eps)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
 
     grid.reset_state()
-    for naza in naza_dqp_list:
-        naza.zero_line_state()
-        naza.update_bus_state()
-        naza.reset_params()
+    for controller in controller_dqp_list:
+        controller.zero_line_state()
+        controller.update_bus_state()
+        controller.reset_params()
 
     noise = disturbances[0:T]
     t = 0
     print("solving")
     start_time = time.time()
     actions_curt, actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-        utils_dQPTH.get_next_action(grid, naza_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=False)
+        controller_utils.get_next_action(grid, controller_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=False)
     print(f"solving takes time {time.time() - start_time}")
     print("done solving")
     grid.reset_state()
-    for naza in naza_dqp_list:
-        naza.zero_line_state()
-        naza.update_bus_state()
-        naza.reset_params()
+    for controller in controller_dqp_list:
+        controller.zero_line_state()
+        controller.update_bus_state()
+        controller.reset_params()
 
     viol_per_step = torch.zeros(T)
     curt_cost_per_step = torch.zeros(T)
@@ -238,7 +221,7 @@ def get_multi_agent_vanilla_MPC(grid, T, H, disturbances, batt_cost, curt_change
     nodes_2 = [i for i in range(43, 69)] + [41, 72]
     nodes_3 = [i for i in range(73, 112)] + [69, 70, 71, 115, 117]
     partition = [nodes_1, nodes_2, nodes_3]
-    base_naza_list = utils_dQPTH.create_base_nazas(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
+    base_controller_list = controller_utils.create_base_controllers(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
                                                  curt_net_cost, slack_cost)
     pool = mp.Pool(processes=num_agents)
     dqp_eps = 1e-3
@@ -246,9 +229,9 @@ def get_multi_agent_vanilla_MPC(grid, T, H, disturbances, batt_cost, curt_change
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
 
     grid.reset_state()
-    for naza in base_naza_list:
-        naza.update_line_state()
-        naza.update_bus_state()
+    for controller in base_controller_list:
+        controller.update_line_state()
+        controller.update_bus_state()
 
     actions_curt = torch.zeros(T, grid.num_curt)
     actions_batt = torch.zeros(T, grid.num_batt)
@@ -261,7 +244,7 @@ def get_multi_agent_vanilla_MPC(grid, T, H, disturbances, batt_cost, curt_change
     for t in tqdm(range(T)):
         noise = disturbances[t:t+H]
         pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-            utils_dQPTH.get_next_action_base(grid, base_naza_list, noise, t, verbose=False, update_state=True)
+            controller_utils.get_next_action_base(grid, base_controller_list, noise, t, verbose=False, update_state=True)
 
         action_curt = pred_actions_curt[0]
         action_batt = pred_actions_batt[0]
@@ -302,14 +285,14 @@ def get_multi_agent_vanilla_MPC(grid, T, H, disturbances, batt_cost, curt_change
     return ckpt
 
 
-def evaluate_base_on_traj(grid, base_naza_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost):
+def evaluate_base_on_traj(grid, base_controller_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost):
     """
     Gets cost associated with running base MPCs on a test trajectory.
     """
     grid.reset_state()
-    for naza in base_naza_list:
-        naza.update_line_state()
-        naza.update_bus_state()
+    for controller in base_controller_list:
+        controller.update_line_state()
+        controller.update_bus_state()
     actions_curt = torch.zeros(T, grid.num_curt)
     actions_batt = torch.zeros(T, grid.num_batt)
     viol_per_step = torch.zeros(T)
@@ -321,12 +304,12 @@ def evaluate_base_on_traj(grid, base_naza_list, dQPTH_layer, test_traj, T, H, ba
     total_train_loss = 0
 
     for t in range(T):
-        for naza in base_naza_list:
-            naza.update_line_state()
-            naza.update_bus_state()
+        for controller in base_controller_list:
+            controller.update_line_state()
+            controller.update_bus_state()
         noise = test_traj[t:t+H,:]
         pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-            utils_dQPTH.get_next_action_base(grid, base_naza_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
+            controller_utils.get_next_action_base(grid, base_controller_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
 
         action_curt = pred_actions_curt[0]
         action_batt = pred_actions_batt[0]
@@ -347,11 +330,6 @@ def evaluate_base_on_traj(grid, base_naza_list, dQPTH_layer, test_traj, T, H, ba
         batt_charge_deviation = grid.state[grid.state_batt_charge_idx] - grid.target_batt_charges
         batt_loss = batt_cost * torch.sum(batt_charge_deviation ** 2)
         curt_loss = curt_change_cost * torch.sum(action_curt ** 2) + curt_net_cost * torch.sum(net_curt ** 2)
-        # print(curt_violations / torch.concat([grid.curt_max_limits, grid.curt_max_limits]))
-        # print("\nFrom NAZA evals:")
-        # print(f"batt charge: {torch.sum(scaled_batt_charge_violations.abs())} batt power: {torch.sum(scaled_batt_power_violations.abs())} curt viol: {torch.sum(scaled_curt_violations.abs())}\n" +
-        #       f"batt loss: {batt_loss}, curt loss: {curt_loss}, bus loss: {bus_violations_loss}, line loss: {line_violations_loss} scaled viols {torch.sum(line_violations / grid.line_data[:,5])}\n" +
-        #       f"true line violations: {torch.sum(line_violations)}")
         total_loss += batt_loss + curt_loss + line_violations_loss
         total_train_loss += batt_loss + curt_loss + line_slack_cost * torch.sum(line_violations ** 2)
         total_econ_loss += batt_loss + curt_loss
@@ -377,14 +355,14 @@ def evaluate_base_on_traj(grid, base_naza_list, dQPTH_layer, test_traj, T, H, ba
     return ckpt
 
 # @profile
-def evaluate_on_traj(grid, naza_dqp_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost):
+def evaluate_on_traj(grid, controller_dqp_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost):
     """
     Gets cost associated with running MPC with configured limits on a test trajectory.
     """
     grid.reset_state()
-    for naza in naza_dqp_list:
-        naza.zero_line_state()
-        naza.update_bus_state()
+    for controller in controller_dqp_list:
+        controller.zero_line_state()
+        controller.update_bus_state()
 
     test_total_loss = torch.zeros(3)
     dQPTH_layer.reset_cache()
@@ -402,7 +380,7 @@ def evaluate_on_traj(grid, naza_dqp_list, dQPTH_layer, test_traj, T, H, batt_cos
     for t in range(T):
         noise = test_traj[t:t+H,:]
         pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-            utils_dQPTH.get_next_action(grid, naza_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
+            controller_utils.get_next_action(grid, controller_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
 
         action_curt = pred_actions_curt[0]
         action_batt = pred_actions_batt[0]
@@ -472,7 +450,7 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
     # We set T=H, H=T since this gets us the size-T prediction window while also setting us up to learn limits for T+H steps.
     # TODO: do this in a way that is less hacky, also think about the fact that size-T prediction window uses only T limits, while
     # MPC rollout uses T+H
-    naza_dqp_list = utils_dQPTH.create_split_constraint_nazas(grid, num_agents, partition, H, T, batt_cost, curt_change_cost,
+    controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, H, T, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost)
     pool = mp.Pool(processes=num_agents)
     dqp_eps = 1e-3
@@ -485,12 +463,12 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
     steps_per_epoch = (num_traj + batch_size - 1) // batch_size
 
     grid.reset_state()
-    for naza in naza_dqp_list:
-        naza.zero_line_state()
-        naza.update_bus_state()
-        naza.reset_params()
+    for controller in controller_dqp_list:
+        controller.zero_line_state()
+        controller.update_bus_state()
+        controller.reset_params()
 
-    param_groups = [{'params': [naza.line_max_change, naza.line_min_change]} for naza in naza_dqp_list]
+    param_groups = [{'params': [controller.line_max_change, controller.line_min_change]} for controller in controller_dqp_list]
     optimizer = _make_optimizer(param_groups, optimizer_type, lr)
     scheduler = _make_scheduler(optimizer, lr_schedule, schedule_kwargs, epochs * steps_per_epoch)
 
@@ -530,13 +508,13 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
                 total_viol_loss = 0
                 total_train_loss = 0
                 grid.reset_state()
-                for naza in naza_dqp_list:
-                    naza.zero_line_state()
-                    naza.update_bus_state()
+                for controller in controller_dqp_list:
+                    controller.zero_line_state()
+                    controller.update_bus_state()
 
                 start_time = time.time()
                 pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-                        utils_dQPTH.get_next_action(grid, naza_dqp_list, train_disturbances[0:T,:], 0, dQPTH_layer, verbose=False, update_state=True)
+                        controller_utils.get_next_action(grid, controller_dqp_list, train_disturbances[0:T,:], 0, dQPTH_layer, verbose=False, update_state=True)
                 for t in range(T):
                     noise = train_disturbances[t]
                     action_curt = pred_actions_curt[t]
@@ -579,12 +557,12 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
                 epoch_train_loss += total_train_loss.detach()
 
             if optimizer_type == 'clipped_gd':
-                all_params = [naza.line_max_change for naza in naza_dqp_list] + \
-                             [naza.line_min_change for naza in naza_dqp_list]
+                all_params = [controller.line_max_change for controller in controller_dqp_list] + \
+                             [controller.line_min_change for controller in controller_dqp_list]
                 torch.nn.utils.clip_grad_norm_(all_params, max_grad_norm)
 
             optimizer.step()
-            _project_params(naza_dqp_list, max_target_sum=total_max_margin, min_target_sum=total_min_margin)
+            _project_params(controller_dqp_list, max_target_sum=total_max_margin, min_target_sum=total_min_margin)
 
         prev_lr = optimizer.param_groups[0]['lr']
         _step_scheduler(scheduler, epoch_total_loss / num_traj)
@@ -601,8 +579,8 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
     line_max_changes = torch.zeros(num_agents, T+H, grid.num_lines)
     line_min_changes = torch.zeros(num_agents, T+H, grid.num_lines)
     for i in range(num_agents):
-        line_max_changes[i] = naza_dqp_list[i].line_max_change
-        line_min_changes[i] = naza_dqp_list[i].line_min_change
+        line_max_changes[i] = controller_dqp_list[i].line_max_change
+        line_min_changes[i] = controller_dqp_list[i].line_min_change
 
     ckpt = dict()
     ckpt["line_max_changes"] = line_max_changes
@@ -630,7 +608,7 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
     nodes_3 = [i for i in range(73, 112)] + [69, 70, 71, 115, 117]
     partition = [nodes_1, nodes_2, nodes_3]
 
-    naza_dqp_list = utils_dQPTH.create_split_constraint_nazas(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
+    controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost)
     pool = mp.Pool(processes=num_agents)
     dqp_eps = 1e-3
@@ -643,12 +621,12 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
     steps_per_epoch = (num_traj + batch_size - 1) // batch_size
 
     grid.reset_state()
-    for naza in naza_dqp_list:
-        naza.zero_line_state()
-        naza.update_bus_state()
-        naza.reset_params()
+    for controller in controller_dqp_list:
+        controller.zero_line_state()
+        controller.update_bus_state()
+        controller.reset_params()
 
-    param_groups = [{'params': [naza.line_max_change, naza.line_min_change]} for naza in naza_dqp_list]
+    param_groups = [{'params': [controller.line_max_change, controller.line_min_change]} for controller in controller_dqp_list]
     optimizer = _make_optimizer(param_groups, optimizer_type, lr)
     scheduler = _make_scheduler(optimizer, lr_schedule, schedule_kwargs, epochs * steps_per_epoch)
 
@@ -688,15 +666,15 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
                 total_viol_loss = 0
                 total_train_loss = 0
                 grid.reset_state()
-                for naza in naza_dqp_list:
-                    naza.zero_line_state()
-                    naza.update_bus_state()
+                for controller in controller_dqp_list:
+                    controller.zero_line_state()
+                    controller.update_bus_state()
 
                 start_time = time.time()
                 for t in range(T):
                     noise = train_disturbances[t:t+H,:]
                     pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-                        utils_dQPTH.get_next_action(grid, naza_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
+                        controller_utils.get_next_action(grid, controller_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
                     action_curt = pred_actions_curt[0]
                     action_batt = pred_actions_batt[0]
                     grid.update_state(action_curt, action_batt, noise[0])
@@ -737,12 +715,12 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
                 epoch_train_loss += total_train_loss.detach()
 
             if optimizer_type == 'clipped_gd':
-                all_params = [naza.line_max_change for naza in naza_dqp_list] + \
-                             [naza.line_min_change for naza in naza_dqp_list]
+                all_params = [controller.line_max_change for controller in controller_dqp_list] + \
+                             [controller.line_min_change for controller in controller_dqp_list]
                 torch.nn.utils.clip_grad_norm_(all_params, max_grad_norm)
 
             optimizer.step()
-            _project_params(naza_dqp_list, max_target_sum=total_max_margin, min_target_sum=total_min_margin)
+            _project_params(controller_dqp_list, max_target_sum=total_max_margin, min_target_sum=total_min_margin)
 
         prev_lr = optimizer.param_groups[0]['lr']
         _step_scheduler(scheduler, epoch_total_loss / num_traj)
@@ -759,8 +737,8 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
     line_max_changes = torch.zeros(num_agents, T+H, grid.num_lines)
     line_min_changes = torch.zeros(num_agents, T+H, grid.num_lines)
     for i in range(num_agents):
-        line_max_changes[i] = naza_dqp_list[i].line_max_change
-        line_min_changes[i] = naza_dqp_list[i].line_min_change
+        line_max_changes[i] = controller_dqp_list[i].line_max_change
+        line_min_changes[i] = controller_dqp_list[i].line_min_change
 
     ckpt = dict()
     ckpt["line_max_changes"] = line_max_changes
@@ -793,7 +771,7 @@ def eval_limits_surrogate(grid, line_max_changes, line_min_changes, T, H, all_tr
     nodes_3 = [i for i in range(73, 112)] + [69, 70, 71, 115, 117]
     partition = [nodes_1, nodes_2, nodes_3]
 
-    naza_dqp_list = utils_dQPTH.create_split_constraint_nazas(grid, num_agents, partition, H, T, batt_cost, curt_change_cost,
+    controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, H, T, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost)
     print("hi 2", flush=True)
     pool = mp.Pool(processes=num_agents)
@@ -804,15 +782,15 @@ def eval_limits_surrogate(grid, line_max_changes, line_min_changes, T, H, all_tr
     num_traj = all_train_traj.shape[0]
 
     grid.reset_state()
-    for naza in naza_dqp_list:
-        naza.zero_line_state()
-        naza.update_bus_state()
-        naza.reset_params()
+    for controller in controller_dqp_list:
+        controller.zero_line_state()
+        controller.update_bus_state()
+        controller.reset_params()
 
     with torch.no_grad():
         for i in range(num_agents):
-            naza_dqp_list[i].line_max_change.copy_(line_max_changes[i])
-            naza_dqp_list[i].line_min_change.copy_(line_min_changes[i])
+            controller_dqp_list[i].line_max_change.copy_(line_max_changes[i])
+            controller_dqp_list[i].line_min_change.copy_(line_min_changes[i])
 
     total_max_margin = torch.zeros(T+H, grid.num_lines)
     total_min_margin = torch.zeros(T+H, grid.num_lines)
@@ -830,12 +808,12 @@ def eval_limits_surrogate(grid, line_max_changes, line_min_changes, T, H, all_tr
         total_viol_loss = 0
         total_train_loss = 0
         grid.reset_state()
-        for naza in naza_dqp_list:
-            naza.zero_line_state()
-            naza.update_bus_state()
+        for controller in controller_dqp_list:
+            controller.zero_line_state()
+            controller.update_bus_state()
 
         pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-                utils_dQPTH.get_next_action(grid, naza_dqp_list, train_disturbances[0:T,:], 0, dQPTH_layer, verbose=False, update_state=True)
+                controller_utils.get_next_action(grid, controller_dqp_list, train_disturbances[0:T,:], 0, dQPTH_layer, verbose=False, update_state=True)
         for t in range(T):
             noise = train_disturbances[t]
             action_curt = pred_actions_curt[t]
@@ -886,7 +864,7 @@ def eval_limits_rollout(grid, line_max_changes, line_min_changes, T, H, all_trai
     nodes_3 = [i for i in range(73, 112)] + [69, 70, 71, 115, 117]
     partition = [nodes_1, nodes_2, nodes_3]
 
-    naza_dqp_list = utils_dQPTH.create_split_constraint_nazas(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
+    controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost)
     pool = mp.Pool(processes=num_agents)
     dqp_eps = 1e-3
@@ -896,15 +874,15 @@ def eval_limits_rollout(grid, line_max_changes, line_min_changes, T, H, all_trai
     num_traj = all_train_traj.shape[0]
 
     grid.reset_state()
-    for naza in naza_dqp_list:
-        naza.zero_line_state()
-        naza.update_bus_state()
-        naza.reset_params()
+    for controller in controller_dqp_list:
+        controller.zero_line_state()
+        controller.update_bus_state()
+        controller.reset_params()
 
     with torch.no_grad():
         for i in range(num_agents):
-            naza_dqp_list[i].line_max_change.copy_(line_max_changes[i])
-            naza_dqp_list[i].line_min_change.copy_(line_min_changes[i])
+            controller_dqp_list[i].line_max_change.copy_(line_max_changes[i])
+            controller_dqp_list[i].line_min_change.copy_(line_min_changes[i])
 
     total_max_margin = torch.zeros(T+H, grid.num_lines)
     total_min_margin = torch.zeros(T+H, grid.num_lines)
@@ -921,14 +899,14 @@ def eval_limits_rollout(grid, line_max_changes, line_min_changes, T, H, all_trai
         total_viol_loss = 0
         total_train_loss = 0
         grid.reset_state()
-        for naza in naza_dqp_list:
-            naza.zero_line_state()
-            naza.update_bus_state()
+        for controller in controller_dqp_list:
+            controller.zero_line_state()
+            controller.update_bus_state()
 
         for t in range(T):
             noise = train_disturbances[t:t+H,:]
             pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-                utils_dQPTH.get_next_action(grid, naza_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
+                controller_utils.get_next_action(grid, controller_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
             action_curt = pred_actions_curt[0]
             action_batt = pred_actions_batt[0]
             grid.update_state(action_curt, action_batt, noise[0])
