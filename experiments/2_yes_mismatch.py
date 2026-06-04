@@ -175,7 +175,7 @@ def main(args):
                     try:
                         ckpt_ours = evals.evaluate_on_traj(grid, controller_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost)
                         our_losses[j] = ckpt_ours["total_losses"]
-                        print(f"test loss was {ckpt_ours["total_losses"]}")
+                        print(f"test loss was {ckpt_ours['total_losses']}")
                     except Exception as e:
                         print(f"Evaluate on test traj failed for test_seed {test_seed}, j {j}, exception {e}")
                         failed_tests[(i,j)] = test_traj
