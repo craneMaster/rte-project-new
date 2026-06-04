@@ -491,7 +491,7 @@ class differentiate_QP(torch.autograd.Function):
 
 
 def build_settings(check_PSD=False,time=False,solve_type="dense",dual_available=None,normalize_constraints=False,empty_batch=True,warm_start_from_previous=False,omp_parallel=False,n_cpu=None, # general arguments
-                   eps_active=1e-5,refine_active=False, # active arguments
+                   refine_active=False, # active arguments
                    qp_solver=None,verbose=False,qp_solver_keywords=None,eps_abs=1e-6,eps_rel=0, # qp solver arguments ... default to solver preference
                    lin_solver=None): # linear solver arguments
 
@@ -561,9 +561,6 @@ def build_settings(check_PSD=False,time=False,solve_type="dense",dual_available=
         "empty_batch": empty_batch,
         "warm_start_from_previous": warm_start_from_previous,
         "qp_solver_keywords" : qp_solver_keywords,
-        "eps_active": eps_active,
-        "eps_abs": eps_active,
-        "eps_rel": eps_active,
         "lin_solver": lin_solver,
         "refine_active": refine_active,
         "omp_parallel" : omp_parallel,

@@ -1,7 +1,6 @@
-import sys, argparse
+import sys, os, argparse
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import os
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -81,10 +80,10 @@ def main(args):
     print(f"Checkpoint for this run will be saved at {folder}checkpoint_{tag}.pt")
     os.makedirs(folder, exist_ok=True)
 
-    line_data_loc = '../data/case118_line_data.pt'
-    bus_data_loc = '../data/case118_bus_data.pt'
-    gen_data_loc = '../data/case118_gen_data.pt'
-    ptdf_data_loc = '../data/case118_ptdf_data.pt'
+    line_data_loc = 'data/case118_line_data.pt'
+    bus_data_loc = 'data/case118_bus_data.pt'
+    gen_data_loc = 'data/case118_gen_data.pt'
+    ptdf_data_loc = 'data/case118_ptdf_data.pt'
 
     bus_with_curt = torch.load(gen_data_loc, weights_only=True)[:,0].int()
     num_curt = bus_with_curt.shape[0]
@@ -123,8 +122,7 @@ def main(args):
     num_test_torch_seeds = test_trajs_with_mismatch["num_torch_seeds"]
 
     pool = mp.Pool(processes=num_agents)
-    dqp_eps = 1
-    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True, eps_active=dqp_eps)
+    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
 
     # for i in range(1):

@@ -12,7 +12,6 @@ import grid_pkg
 import controller_pkg
 import controller_utils
 import dQPTH
-import evals
 
 torch.set_default_dtype(torch.double)
 torch.set_printoptions(threshold=10000)
@@ -106,10 +105,9 @@ def get_central_full_traj(grid, T, H, disturbances, batt_cost, curt_change_cost,
     partition = [[i for i in range(grid.num_buses)]]
     num_agents = 1
     controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, T, T, batt_cost, curt_change_cost,
-                                                            curt_net_cost, bus_slack_cost, line_slack_cost, active_eps=1)
+                                                            curt_net_cost, bus_slack_cost, line_slack_cost)
     pool = mp.Pool(processes=num_agents)
-    dqp_eps = 1e-3
-    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True, eps_active=dqp_eps)
+    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
 
     grid.reset_state()
@@ -181,107 +179,6 @@ def get_central_full_traj(grid, T, H, disturbances, batt_cost, curt_change_cost,
 
     pool.close()
 
-    return ckpt
-
-
-def get_multi_agent_vanilla_MPC(grid, T, H, disturbances, batt_cost, curt_change_cost, curt_net_cost, slack_cost):
-    """
-    Simulates what a collection of non-communicating controllers would do.
-
-    Args:
-        grid (Grid object):
-            defines the grid that control problem is set up on
-        T (int):
-            trajectory length
-        H (int):
-            horizon of MPC
-        disturbances (Torch tensor of shape (1, T+H, grid.num_buses)):
-            future disturbances
-        batt_cost (float):
-            battery cost
-        curt_change_cost (float):
-            cost per step associated with changing curtailment orders
-        curt_net_cost (float):
-            cost per step associated with net curtailment
-        slack_cost (float):
-            cost associated with constraint violations
-    Returns:
-        ckpt (dict): Contains run results, keys are:
-            actions_curt (Torch tensor of shape (T, grid.num_curt)):
-                curtailment actions that would be taken
-            actions_batt (Torch tensor of shape (T, grid.num_batt)):
-                battery actions that would be taken
-            viol_per_step (Torch tensor of shape (T)):
-                squared violation at each step
-            curt_cost_per_step (Torch tensor of shape (T)):
-                curtailment cost incurred at each step
-    """
-    num_agents = 3
-    nodes_1 = [i for i in range(0, 41)] + [42, 112, 113, 114, 116]
-    nodes_2 = [i for i in range(43, 69)] + [41, 72]
-    nodes_3 = [i for i in range(73, 112)] + [69, 70, 71, 115, 117]
-    partition = [nodes_1, nodes_2, nodes_3]
-    base_controller_list = controller_utils.create_base_controllers(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
-                                                 curt_net_cost, slack_cost)
-    pool = mp.Pool(processes=num_agents)
-    dqp_eps = 1e-3
-    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True, eps_active=dqp_eps)
-    dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
-
-    grid.reset_state()
-    for controller in base_controller_list:
-        controller.update_line_state()
-        controller.update_bus_state()
-
-    actions_curt = torch.zeros(T, grid.num_curt)
-    actions_batt = torch.zeros(T, grid.num_batt)
-    viol_per_step = torch.zeros(T)
-    curt_cost_per_step = torch.zeros(T)
-    batt_charge_viol_scale = (torch.mean(grid.line_limits) / torch.mean(grid.batt_charge_max_limits)) ** 2
-    batt_power_viol_scale = (torch.mean(grid.line_limits) / torch.mean(grid.batt_power_max_limits)) ** 2
-    curt_viol_scale = (torch.mean(grid.line_limits) / torch.mean(grid.curt_max_limits)) ** 2
-
-    for t in tqdm(range(T)):
-        noise = disturbances[t:t+H]
-        pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
-            controller_utils.get_next_action_base(grid, base_controller_list, noise, t, verbose=False, update_state=True)
-
-        action_curt = pred_actions_curt[0]
-        action_batt = pred_actions_batt[0]
-        actions_curt[t] = action_curt.detach()
-        actions_batt[t] = action_batt.detach()
-        grid.update_state(action_curt, action_batt, noise[0,:])
-
-        net_curt = grid.state[grid.state_curt_idx]
-        bus_violations = torch.relu(grid.H_x @ grid.state - grid.H_limit)[2*grid.num_lines:]
-        batt_charge_violations = bus_violations[:2*grid.num_buses]
-        batt_power_violations = bus_violations[2*grid.num_buses:4*grid.num_buses]
-        curt_violations = bus_violations[4*grid.num_buses:]
-        scaled_bus_viols = batt_charge_viol_scale * torch.sum(batt_charge_violations ** 2) \
-                        + batt_power_viol_scale * torch.sum(batt_power_violations ** 2) \
-                        + curt_viol_scale * torch.sum(curt_violations ** 2)
-        line_flows = grid.state[grid.state_line_flow_idx]
-        line_limits = grid.line_data[:,5]
-        line_violations = torch.relu(torch.abs(line_flows) - line_limits)
-
-        curt_loss = curt_change_cost * torch.sum(action_curt ** 2) + curt_net_cost * torch.sum(net_curt ** 2)
-        viol_loss = slack_cost * (scaled_bus_viols + torch.sum(line_violations ** 2))
-
-        curt_cost_per_step[t] = curt_loss.detach()
-        viol_per_step[t] = viol_loss.detach()
-
-    curt_cost_per_step = curt_cost_per_step.detach()
-    viol_per_step = viol_per_step.detach()
-    total_loss = torch.sum(curt_cost_per_step) + torch.sum(viol_per_step)
-
-    ckpt = {
-        "actions_curt": actions_curt.detach(),
-        "actions_batt": actions_batt.detach(),
-        "viol_per_step": viol_per_step.detach(),
-        "curt_cost_per_step": curt_cost_per_step.detach(),
-        "total_loss": total_loss.detach()
-    }
-    pool.close()
     return ckpt
 
 
@@ -453,8 +350,7 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
     controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, H, T, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost)
     pool = mp.Pool(processes=num_agents)
-    dqp_eps = 1e-3
-    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True, eps_active=dqp_eps)
+    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
 
     num_traj = all_train_traj.shape[0]
@@ -611,8 +507,7 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
     controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost)
     pool = mp.Pool(processes=num_agents)
-    dqp_eps = 1e-3
-    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True, eps_active=dqp_eps)
+    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
 
     num_traj = all_train_traj.shape[0]
@@ -775,8 +670,7 @@ def eval_limits_surrogate(grid, line_max_changes, line_min_changes, T, H, all_tr
                                                             curt_net_cost, bus_slack_cost, line_slack_cost)
     print("hi 2", flush=True)
     pool = mp.Pool(processes=num_agents)
-    dqp_eps = 1e-3
-    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True, eps_active=dqp_eps)
+    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
 
     num_traj = all_train_traj.shape[0]
@@ -867,8 +761,7 @@ def eval_limits_rollout(grid, line_max_changes, line_min_changes, T, H, all_trai
     controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost)
     pool = mp.Pool(processes=num_agents)
-    dqp_eps = 1e-3
-    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True, eps_active=dqp_eps)
+    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
 
     num_traj = all_train_traj.shape[0]
