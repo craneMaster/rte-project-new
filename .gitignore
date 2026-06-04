@@ -1,3 +1,12 @@
-__pycache__/
-*.py[cod]
+*.out
+*.err
 *.pyc
+*.DS_Store
+.DS_Store
+grid_simulation/.DS_Store
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+grid_simulation/__pycache__/
+pycache/
