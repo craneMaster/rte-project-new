@@ -84,6 +84,7 @@ class Base_Controller(nn.Module):
         self.H = H
         self.buses_in_area = buses_in_area
         self.eps = eps
+        self.control_delay = grid.control_delay
 
         if batt_cost < 0:
             raise ValueError(f"batt_cost {batt_cost} is negative.")
@@ -201,9 +202,49 @@ class Base_Controller(nn.Module):
         self.line_lower_limits = -self.grid.line_data[self.lines_in_area,5]
 
 
+    def _couple_bus_actions_to_dynamics_row(self, block_row, state_step):
+        """Couple horizon actions to bus-state dynamics with control_delay offset."""
+        action_step = state_step - self.control_delay
+        if action_step < 0:
+            return
+        action_batt_idx = action_step * self.num_batt + self.action_batt_start_idx
+        action_curt_idx = action_step * self.num_curt + self.action_curt_start_idx
+        block_row[:, action_batt_idx:action_batt_idx + self.num_batt] = -self.bus_B_batt
+        block_row[:, action_curt_idx:action_curt_idx + self.num_curt] = -self.bus_B_curt
+
+
+    def _couple_line_actions_to_dynamics_row(self, block_row, state_step):
+        """Couple horizon actions to line-state dynamics with control_delay offset."""
+        action_step = state_step - self.control_delay
+        if action_step < 0:
+            return
+        action_batt_idx = action_step * self.num_batt + self.action_batt_start_idx
+        action_curt_idx = action_step * self.num_curt + self.action_curt_start_idx
+        block_row[:, action_batt_idx:action_batt_idx + self.num_batt] = -self.line_B_batt
+        block_row[:, action_curt_idx:action_curt_idx + self.num_curt] = -self.line_B_curt
+
+
+    def _past_action_bus_rhs(self, state_step):
+        if state_step >= self.control_delay:
+            return torch.zeros(self.bus_state_dim)
+        past_curt, past_batt = self.grid.get_past_actions(state_step)
+        local_past_curt = past_curt[self.curt_idx]
+        local_past_batt = past_batt[self.batt_idx]
+        return self.bus_B_curt @ local_past_curt + self.bus_B_batt @ local_past_batt
+
+
+    def _past_action_line_rhs(self, state_step):
+        if state_step >= self.control_delay:
+            return torch.zeros(self.line_state_dim)
+        past_curt, past_batt = self.grid.get_past_actions(state_step)
+        local_past_curt = past_curt[self.curt_idx]
+        local_past_batt = past_batt[self.batt_idx]
+        return self.line_B_curt @ local_past_curt + self.line_B_batt @ local_past_batt
+
+
     def init_matrices(self):
         # ----------------------------------------------------------------------------------------
-        # aggregate vector is bus state, bus slack, line state, line max slack, line min slack, batt action, curt action
+        # aggregate vector is bus state, line state, line max slack, line min slack, batt action, curt action
         self.z_dim = self.H * (self.bus_state_dim + self.line_state_dim + self.line_max_slack_dim \
                             + self.line_min_slack_dim + self.num_batt + self.num_curt)
         self.eq_dim = self.H * (self.bus_state_dim + self.line_state_dim)
@@ -257,8 +298,7 @@ class Base_Controller(nn.Module):
             if not i == 0:
                 block_row[:,(i-1)*self.bus_state_dim:i*self.bus_state_dim] = -self.bus_A
             block_row[:,i*self.bus_state_dim:(i+1)*self.bus_state_dim] = torch.eye(self.bus_state_dim)
-            block_row[:,action_batt_idx:action_batt_idx+self.num_batt] = -self.bus_B_batt
-            block_row[:,action_curt_idx:action_curt_idx+self.num_curt] = -self.bus_B_curt
+            self._couple_bus_actions_to_dynamics_row(block_row, i)
 
             row_idx = i * self.bus_state_dim
             self.A[row_idx:row_idx+self.bus_state_dim] = block_row
@@ -273,8 +313,7 @@ class Base_Controller(nn.Module):
             if not i == 0:
                 block_row[:,idx-self.line_state_dim:idx] = -torch.eye(self.line_state_dim)
             block_row[:,idx:idx+self.line_state_dim] = torch.eye(self.line_state_dim)
-            block_row[:,action_batt_idx:action_batt_idx+self.num_batt] = -self.line_B_batt
-            block_row[:,action_curt_idx:action_curt_idx+self.num_curt] = -self.line_B_curt
+            self._couple_line_actions_to_dynamics_row(block_row, i)
 
             row_idx = i * self.line_state_dim + self.H * self.bus_state_dim
             self.A[row_idx:row_idx+self.line_state_dim] = block_row
@@ -457,8 +496,13 @@ class Base_Controller(nn.Module):
         b[0:self.bus_state_dim] = self.bus_A @ self.bus_state
 
         for i in range(self.H):
+            row_idx = i * self.bus_state_dim
+            b[row_idx:row_idx + self.bus_state_dim] += self._past_action_bus_rhs(i)
+
+        for i in range(self.H):
             row_idx = i * self.line_state_dim + self.H * self.bus_state_dim
             b[row_idx:row_idx+self.line_state_dim] = self.line_B_noise @ disturbances[i]
+            b[row_idx:row_idx+self.line_state_dim] += self._past_action_line_rhs(i)
 
         row_idx = self.H * self.bus_state_dim
         b[row_idx:row_idx+self.line_state_dim] = self.line_state
@@ -647,7 +691,7 @@ class Split_Constraint_Controller(Base_Controller):
         self.line_B_batt = self.grid.B_batt[0:self.grid.num_lines,self.batt_idx]
         self.line_B_noise = self.grid.B_noise[0:self.grid.num_lines,self.buses_in_area]
         # ----------------------------------------------------------------------------------------
-        # aggregate vector is bus state, bus slack, line state, line max slack, line min slack, batt action, curt action
+        # aggregate vector is bus state, line state, line max slack, line min slack, batt action, curt action
         self.z_dim = H * (self.bus_state_dim + self.line_state_dim + self.line_max_slack_dim \
                             + self.line_min_slack_dim + self.num_batt + self.num_curt)
         self.eq_dim = H * (self.bus_state_dim + self.line_state_dim)
@@ -701,8 +745,7 @@ class Split_Constraint_Controller(Base_Controller):
             if not i == 0:
                 block_row[:,(i-1)*self.bus_state_dim:i*self.bus_state_dim] = -self.bus_A
             block_row[:,i*self.bus_state_dim:(i+1)*self.bus_state_dim] = torch.eye(self.bus_state_dim)
-            block_row[:,action_batt_idx:action_batt_idx+self.num_batt] = -self.bus_B_batt
-            block_row[:,action_curt_idx:action_curt_idx+self.num_curt] = -self.bus_B_curt
+            self._couple_bus_actions_to_dynamics_row(block_row, i)
 
             row_idx = i * self.bus_state_dim
             self.A[row_idx:row_idx+self.bus_state_dim] = block_row
@@ -717,8 +760,7 @@ class Split_Constraint_Controller(Base_Controller):
             if not i == 0:
                 block_row[:,idx-self.line_state_dim:idx] = -torch.eye(self.line_state_dim)
             block_row[:,idx:idx+self.line_state_dim] = torch.eye(self.line_state_dim)
-            block_row[:,action_batt_idx:action_batt_idx+self.num_batt] = -self.line_B_batt
-            block_row[:,action_curt_idx:action_curt_idx+self.num_curt] = -self.line_B_curt
+            self._couple_line_actions_to_dynamics_row(block_row, i)
 
             row_idx = i * self.line_state_dim + H * self.bus_state_dim
             self.A[row_idx:row_idx+self.line_state_dim] = block_row
@@ -953,8 +995,13 @@ class Split_Constraint_Controller(Base_Controller):
         b[0:self.bus_state_dim] = self.bus_A @ self.bus_state
 
         for i in range(self.H):
+            row_idx = i * self.bus_state_dim
+            b[row_idx:row_idx + self.bus_state_dim] += self._past_action_bus_rhs(i)
+
+        for i in range(self.H):
             row_idx = i * self.line_state_dim + self.H * self.bus_state_dim
             b[row_idx:row_idx+self.line_state_dim] = self.line_B_noise @ disturbances[i]
+            b[row_idx:row_idx+self.line_state_dim] += self._past_action_line_rhs(i)
 
         row_idx = self.H * self.bus_state_dim
         b[row_idx:row_idx+self.line_state_dim] += self.line_state

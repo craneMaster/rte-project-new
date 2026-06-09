@@ -83,7 +83,8 @@ class Grid:
         Indices for getting curtailment from overall state vector.
     """
 
-    def __init__(self, bus_with_curt, bus_with_batt, delta_t, line_data_loc, bus_data_loc, gen_data_loc, ptdf_data_loc):
+    def __init__(self, bus_with_curt, bus_with_batt, delta_t, line_data_loc, bus_data_loc, gen_data_loc, ptdf_data_loc,
+                 control_delay=0):
         """
         Args:
             bus_with_curt (Torch matrix, shape (num_curt)):
@@ -92,6 +93,9 @@ class Grid:
                 List of bus numbers with a battery, contains int values
             delta_t (Double):
                 Time between grid updates
+            control_delay (int):
+                Number of timesteps between issuing a control action and its effect on grid state.
+                Zero means immediate effect (default).
             line_data_loc (String):
                 Location of branch data file
             bus_data_loc (String):
@@ -108,6 +112,9 @@ class Grid:
         self.bus_with_curt = bus_with_curt
         self.bus_with_batt = bus_with_batt
         self.delta_t = float(delta_t)
+        if control_delay < 0:
+            raise ValueError(f"control_delay {control_delay} is negative.")
+        self.control_delay = int(control_delay)
         self.line_data = torch.load(line_data_loc, weights_only=True)
         self.bus_data = torch.load(bus_data_loc, weights_only=True)
         self.gen_data = torch.load(gen_data_loc, weights_only=True)
@@ -128,6 +135,7 @@ class Grid:
 
         self.init_state = torch.cat([init_line_flows, init_batt_charges, init_batt_powers, init_curt_values])
         self.state = self.init_state
+        self._reset_action_buffers()
 
         self.state_line_flow_idx = slice(0, self.num_lines)
         self.state_batt_charge_idx = slice(self.num_lines, self.num_lines + self.num_batt)
@@ -240,7 +248,7 @@ class Grid:
 
         # assuming that all batteries have the same power storage capacity
         self.batt_charge_max_limits = torch.ones(self.num_batt) * (total_max / self.num_batt) / 3600    # conver to MWh
-        self.batt_charge_min_limits = torch.zeros(self.num_batt)
+        self.batt_charge_min_limits = torch.zeros(self.num_batt)  # 'charge' actually means work or energy in physics
 
         # init_batt_charges = self.batt_charge_min_limits\
         #       + np.random.rand(self.num_batt) * (self.batt_charge_max_limits - self.batt_charge_min_limits)
@@ -271,6 +279,14 @@ class Grid:
         return init_curt_values
 
 
+    def _reset_action_buffers(self):
+        """Clear issued-action history and pending delay queue."""
+        self._pending_actions_curt = []
+        self._pending_actions_batt = []
+        self._issued_actions_curt = []
+        self._issued_actions_batt = []
+
+
     def reset_state(self):
         """
         Resets state to its original value.
@@ -281,6 +297,30 @@ class Grid:
             None
         """
         self.state = self.init_state
+        self._reset_action_buffers()
+
+
+    def get_past_actions(self, horizon_step):
+        """
+        Return the action that affects MPC horizon step ``horizon_step`` when it
+        lies before the current planning window (i.e. ``horizon_step < control_delay``).
+
+        At current time t with control_delay d, the issued queue stores actions
+        oldest-first as [u_{t-L}, ..., u_{t-1}] where L = min(t, d). Horizon
+        step i is driven by the effective action at grid time t+i, which is
+        u_{t+i-d}. Its position in the queue is ``pos = L + i - d``; if
+        ``pos < 0`` the action has not yet been issued and the contribution is
+        zero. This warm-up handling matters when t < d: the queue is shorter
+        than d, so naive index-by-horizon-step would alias future-effective
+        actions onto early horizon rows and double-count them.
+        """
+        if self.control_delay == 0 or horizon_step >= self.control_delay:
+            return torch.zeros(self.num_curt), torch.zeros(self.num_batt)
+        queue_len = len(self._issued_actions_curt)
+        pos = queue_len + horizon_step - self.control_delay
+        if pos < 0 or pos >= queue_len:
+            return torch.zeros(self.num_curt), torch.zeros(self.num_batt)
+        return self._issued_actions_curt[pos], self._issued_actions_batt[pos]
 
 
     def update_state(self, action_curt, action_batt, noise):
@@ -295,7 +335,25 @@ class Grid:
             noise (Torch matrix, shape (num_buses)):
                 Vector containing power injection noise across the grid at that timestep.
         """
-        self.state = self.A @ self.state + self.B_curt @ action_curt + self.B_batt @ action_batt + self.B_noise @ noise
+        if self.control_delay == 0:
+            effective_curt, effective_batt = action_curt, action_batt
+        else:
+            self._pending_actions_curt.append(action_curt.clone())
+            self._pending_actions_batt.append(action_batt.clone())
+            if len(self._pending_actions_curt) > self.control_delay:
+                effective_curt = self._pending_actions_curt.pop(0)
+                effective_batt = self._pending_actions_batt.pop(0)
+            else:
+                effective_curt = torch.zeros_like(action_curt)
+                effective_batt = torch.zeros_like(action_batt)
+
+            self._issued_actions_curt.append(action_curt.clone())
+            self._issued_actions_batt.append(action_batt.clone())
+            if len(self._issued_actions_curt) > self.control_delay:
+                self._issued_actions_curt.pop(0)
+                self._issued_actions_batt.pop(0)
+
+        self.state = self.A @ self.state + self.B_curt @ effective_curt + self.B_batt @ effective_batt + self.B_noise @ noise
 
 
     def get_grid_data(self):

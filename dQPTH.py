@@ -19,7 +19,12 @@ parent_dir = os.path.dirname(src_dir)
 sys.path.append(parent_dir)
 
 from dQPTH_helpers.set_solver_tolerance import set_solver_tolerance
-from dQPTH_helpers.gurobi_ws import gurobi_solve_problem as gurobi_ws_solve_problem
+from dQPTH_helpers.gurobi_ws import (
+    gurobi_solve_problem as gurobi_ws_solve_problem,
+    diagnose_qp_failure,
+    gurobi_status_name,
+    qp_constraint_violations,
+)
 
 import dQPTH_helpers.sparse_helper as sparse_helper
 import dQPTH_helpers.lin_solvers as lin_solvers
@@ -215,14 +220,17 @@ class dQPTH_layer(nn.Module):
                     "verbose": self.verbose,
                     "initvals": initvals
                 }
-            qp_solve_args.append((kwargs_main, self.qp_solver_keywords))
+            qp_solve_args.append((self.qp_solver_keywords, kwargs_main))
         results = self.pool.starmap(call_qp_solver_pool_target, qp_solve_args)
         for i in range(self.nBatch):
-            x, y, z, V_basis, C_basis = results[i]
+            x, y, z, V_basis, C_basis, found, extras = results[i]
 
-            if x is None:
-                print("Solver failed to return a solution. Re-solving with verbose and exiting.")
-                raise Exception("Exiting")
+            if x is None or not found:
+                self._report_solver_failure(i, t, qp_solve_args[i][1], extras)
+                raise RuntimeError(
+                    f"QP solver failed for agent {i} at rollout step t={t}: "
+                    f"{extras.get('status_name', 'unknown')}"
+                )
 
             self.x_star_np[i] = x
             # implicitly assumes if nBatch > 1 then duals are available:
@@ -230,6 +238,38 @@ class dQPTH_layer(nn.Module):
             self.nu_star_np[i] = z
             self.x_star_np_cache[(i,t)] = (V_basis, C_basis)
         return None
+
+
+    def _report_solver_failure(self, agent_idx, t, kwargs_main, extras):
+        problem = kwargs_main["problem"]
+        initvals = kwargs_main.get("initvals")
+        status_name = extras.get("status_name", gurobi_status_name(extras.get("status", -1)))
+        eq_viol, ineq_viol = qp_constraint_violations(problem)
+
+        print("\n" + "=" * 72)
+        print(f"Gurobi/QP solve failed")
+        print(f"  agent index : {agent_idx}")
+        print(f"  rollout step: t={t}")
+        print(f"  status      : {status_name} (code {extras.get('status', 'n/a')})")
+        print(f"  problem size: nVar={problem.P.shape[0]}, nEq={0 if problem.A is None else problem.A.shape[0]}, "
+              f"nIneq={0 if problem.G is None else problem.G.shape[0]}")
+        print(f"  violations at x=0: max|Ax-b|={eq_viol:.3e}, max(Gx-h)={ineq_viol:.3e}")
+        if initvals is not None:
+            print("  warm start  : basis from previous step was supplied")
+        else:
+            print("  warm start  : none")
+
+        diag = diagnose_qp_failure(problem, initvals=initvals, verbose=True)
+        print(f"  diagnostic re-solve status: {diag['status_name']} (code {diag['status_code']})")
+        if diag["iis_constraints"]:
+            print(f"  IIS constraints ({len(diag['iis_constraints'])} in conflict):")
+            for name in diag["iis_constraints"][:20]:
+                print(f"    - {name}")
+            if len(diag["iis_constraints"]) > 20:
+                print(f"    ... and {len(diag['iis_constraints']) - 20} more")
+        if "iis_error" in diag:
+            print(f"  IIS error: {diag['iis_error']}")
+        print("=" * 72 + "\n")
 
 
     def setup_diff(self, csc_Q, q, csc_G, G, h, csc_A, b, scipy_Q, scipy_G, scipy_A, t):
@@ -383,7 +423,10 @@ def call_qp_solver_pool_target(qp_solver_keywords, kwargs_main):
         solution = qpsolvers.solve_problem(**full_kwargs)
         bases = (None, None)
 
-    return solution.x, solution.y, solution.z, bases[0], bases[1]
+    extras = dict(getattr(solution, "extras", {}) or {})
+    if "status" in extras and "status_name" not in extras:
+        extras["status_name"] = gurobi_status_name(extras["status"])
+    return solution.x, solution.y, solution.z, bases[0], bases[1], solution.found, extras
 
 
 class differentiate_QP(torch.autograd.Function):
