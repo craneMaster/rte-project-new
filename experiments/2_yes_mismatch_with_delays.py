@@ -205,21 +205,21 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ps", type=float, default=4.0)
-    parser.add_argument("--offset", type=int, default=180)
+    parser.add_argument("--ps", type=float, default=2.0)
+    parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=.001)
     parser.add_argument("--torch_seed", type=int, default=0)
     parser.add_argument("--radius", type=float, default=0.2)
-    parser.add_argument("--perform_tests", type=str2bool, default=False)
+    parser.add_argument("--perform_tests", type=str2bool, default=True)
     parser.add_argument("--optimizer_type", type=str, default="clipped_gd")
     parser.add_argument("--lr_schedule", type=str, default="plateau")
     parser.add_argument("--lr_decay_step", type=int, default=20)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=10)
-    parser.add_argument("--max_grad_norm", type=float, default=3e5)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--max_grad_norm", type=float, default=30000)
     parser.add_argument("--surrogate_mode", type=str2bool, default=False)
-    parser.add_argument("--control_delay", type=int, default=3,
+    parser.add_argument("--control_delay", type=int, default=1,
                         help="Timesteps between issuing a control action and its effect on grid state.")
     parser.add_argument("--job_id", type=str, default="manual") # <- from Slurm
     args = parser.parse_args()

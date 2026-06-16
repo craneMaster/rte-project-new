@@ -91,7 +91,7 @@ def main(args):
     num_batt = bus_with_batt.shape[0]
     delta_t = 15
 
-    grid = grid_pkg.Grid(bus_with_curt, bus_with_batt, delta_t, line_data_loc, bus_data_loc, gen_data_loc, ptdf_data_loc)
+    grid = grid_pkg.Grid(bus_with_curt, bus_with_batt, delta_t, line_data_loc, bus_data_loc, gen_data_loc, ptdf_data_loc, control_delay = args.control_delay)
     T = 20
     H = 5
     
@@ -151,5 +151,6 @@ if __name__ == "__main__":
     parser.add_argument("--test_skew_mag", type=int, default=25)
     parser.add_argument("--radius", type=float, default=0.2)
     parser.add_argument("--job_id", type=str, default="manual") # <- from Slurm
+    parser.add_argument("--control_delay", type=int, default=0)
     args = parser.parse_args()
     main(args)

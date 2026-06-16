@@ -30,6 +30,57 @@ import dQPTH_helpers.sparse_helper as sparse_helper
 import dQPTH_helpers.lin_solvers as lin_solvers
 import time
 
+
+def _schur_d_vals(slacks, lams, eps=1e-8):
+    """Diagonal D_s entries (s / lambda) for the Schur complement top-left block."""
+    s_safe = torch.clamp(slacks.flatten(), min=eps)
+    lam_safe = torch.clamp(lams.flatten(), min=eps)
+    return (s_safe / lam_safe).detach().numpy()
+
+
+def _schur_blocks_from_diagonal_q(scipy_G, scipy_A, Q_inv_diag):
+    """
+    Build fixed Schur blocks when Q is diagonal.
+
+    G Q^{-1} G^T is G @ diag(Q_inv) @ G^T; avoid materializing diag(Q_inv)
+    by column-scaling G (and A) once.
+    """
+    G_scaled = scipy_G.multiply(Q_inv_diag)
+    A_scaled = scipy_A.multiply(Q_inv_diag)
+    S_GG = scipy_G @ G_scaled.T
+    S_GA = scipy_G @ A_scaled.T
+    S_AA = scipy_A @ A_scaled.T
+    return S_GG, S_GA, S_AA
+
+
+def _assemble_schur_csc(S_GG, S_GA, S_AA, d_vals):
+    """Assemble the full Schur matrix S with D_s on the top-left diagonal."""
+    n_ineq = S_GG.shape[0]
+    S = sp.bmat(
+        [
+            [S_GG + sp.diags(d_vals), S_GA],
+            [S_GA.T, S_AA],
+        ],
+        format="csc",
+    )
+    return S, _top_left_diag_data_indices(S, n_ineq)
+
+
+def _top_left_diag_data_indices(S_csc, n_ineq):
+    """Indices into S_csc.data for the top-left block diagonal (one per row)."""
+    diag_data_idx = np.empty(n_ineq, dtype=np.int64)
+    for row in range(n_ineq):
+        start, end = S_csc.indptr[row], S_csc.indptr[row + 1]
+        cols = S_csc.indices[start:end]
+        pos = np.flatnonzero(cols == row)
+        if pos.size != 1:
+            raise ValueError(
+                f"Expected one diagonal entry in Schur row {row}, found {pos.size}"
+            )
+        diag_data_idx[row] = start + pos[0]
+    return diag_data_idx
+
+
 class dQPTH_layer(nn.Module):
     '''solves and differentiates
     x^* = argmin_x 1/2 x^T Q x + q^T x
@@ -180,21 +231,21 @@ class dQPTH_layer(nn.Module):
         '''
 
         # initialize
-        self.x_star_np = [None for i in range(self.nBatch)]
+        self.x_star_np = [None for _ in range(self.nBatch)]
         if self.nEq[0] > 0:
-            self.mu_star_np = [None for i in range(self.nBatch)]
-        self.nu_star_np = [None for i in range(self.nBatch)]
+            self.mu_star_np = [None for _ in range(self.nBatch)]
+        self.nu_star_np = [None for _ in range(self.nBatch)]
 
         mp.set_start_method('spawn', force=True)
-        processes = list()
+        # processes = list()
 
-        x_vals = []
-        y_vals = []
-        z_vals = []
-        V_basis_vals = []
-        C_basis_vals = []
+        # x_vals = []
+        # y_vals = []
+        # z_vals = []
+        # V_basis_vals = []
+        # C_basis_vals = []
 
-        start_time = time.time()
+        # start_time = time.time()
         qp_solve_args = []
         for i in range(self.nBatch):
             if self.warm_start_from_previous and (i,0) in self.x_star_np_cache.keys(): # false if nBatch > 1
@@ -277,95 +328,45 @@ class dQPTH_layer(nn.Module):
         Form the reduced KKT and set-up derivatives through x_star
         Sets non_differentiable check
         '''
-
         x_star_list = []
         for i in range(self.nBatch):
             zhats = torch.tensor(self.x_star_np[i])
             slacks = h[i] - G[i] @ zhats
-            zhats = zhats.unsqueeze(0)
             lams = torch.tensor(self.nu_star_np[i]).unsqueeze(0)
-            nus = torch.tensor(self.mu_star_np[i]).unsqueeze(0)
-            if i not in self.backward_cache.keys():
-                # print(f"making new one for i={i}, t={t}")
-                self.backward_cache[i] = True
+            d_vals = _schur_d_vals(slacks, lams)
 
+            if (i, "S_GG") not in self.backward_cache:
                 eps = 1e-7
-                Q_diag = scipy_Q[i].diagonal()
-                Q_inv_diag = 1.0 / (Q_diag + eps)
-                Q_inv = sp.diags(Q_inv_diag)
+                Q_inv_diag = 1.0 / (scipy_Q[i].diagonal() + eps)
+                S_GG, S_GA, S_AA = _schur_blocks_from_diagonal_q(
+                    scipy_G[i], scipy_A[i], Q_inv_diag
+                )
 
-                eps = 1e-8
-                s_safe = torch.clamp(slacks.flatten(), min=eps)
-                lam_safe = torch.clamp(lams.flatten(), min=eps)
+                self.backward_cache[(i, "S_GG")] = S_GG
+                self.backward_cache[(i, "S_GA")] = S_GA
+                self.backward_cache[(i, "S_AA")] = S_AA
+                self.backward_cache[(i, "S_GG_diag")] = np.asarray(S_GG.diagonal()).ravel()
 
-                # 2. Calculate the diagonal terms (s / lambda)
-                # Note: QPTH calculates lams/slacks for the RHS, but the MATRIX needs slacks/lams
-                d_vals = s_safe / lam_safe
-
-                # 3. Create the sparse diagonal matrix
-                # This goes into your Schur Complement calculation
-                sparse_D_s = sp.diags(d_vals.detach().numpy())
-
-                # 3. Create the sparse diagonal matrix
-                # This goes into your Schur Complement calculation
-
-                # 2. Pre-calculate Q_inv * Transposes (used in assembly and recovery)
-                # Doing this once saves time
-                invQ_GT = Q_inv @ scipy_G[i].T
-                invQ_AT = Q_inv @ scipy_A[i].T
-
-                # 3. Form the Schur Complement Blocks
-                # Block 1,1: G * Q_inv * G^T + D_s
-                S_GG = scipy_G[i] @ invQ_GT
-
-                new_time = time.time()
-                # Block 1,2: G * Q_inv * A^T
-                S_GA = scipy_G[i] @ invQ_AT
-
-                # Block 2,2: A * Q_inv * A^T (Equalities usually have 0 on diagonal, so we just start with this)
-                S_AA = scipy_A[i] @ invQ_AT
-
-                self.backward_cache[(i,"S_GG")] = S_GG
-                self.backward_cache[(i,"S_GA")] = S_GA
-                self.backward_cache[(i,"S_AA")] = S_AA
-                # Assemble the full Schur Matrix S
-                S_blocks = [
-                    [S_GG + sparse_D_s, S_GA],
-                    [S_GA.T,            S_AA]
-                ]
-                S = sp.bmat(S_blocks, format='csc')
+                S, diag_data_idx = _assemble_schur_csc(S_GG, S_GA, S_AA, d_vals)
                 factor = qdldl.Solver(S)
-                self.backward_cache[(i,"factor")] = factor
+                self.backward_cache[(i, "S_csc")] = S
+                self.backward_cache[(i, "diag_data_idx")] = diag_data_idx
+                self.backward_cache[(i, "factor")] = factor
                 self.backward_cache[(i, "indices")] = S.indices.copy()
                 self.backward_cache[(i, "indptr")] = S.indptr.copy()
-
             else:
-                S_GG = self.backward_cache[(i,"S_GG")]
-                S_GA = self.backward_cache[(i,"S_GA")]
-                S_AA = self.backward_cache[(i,"S_AA")]
-                eps = 1e-8
-                s_safe = torch.clamp(slacks.flatten(), min=eps)
-                lam_safe = torch.clamp(lams.flatten(), min=eps)
+                S_GG_diag = self.backward_cache[(i, "S_GG_diag")]
+                S = self.backward_cache[(i, "S_csc")]
+                diag_data_idx = self.backward_cache[(i, "diag_data_idx")]
+                S.data[diag_data_idx] = S_GG_diag + d_vals
 
-                # 2. Calculate the diagonal terms (s / lambda)
-                # Note: QPTH calculates lams/slacks for the RHS, but the MATRIX needs slacks/lams
-                d_vals = s_safe / lam_safe
-                sparse_D_s = sp.diags(d_vals.detach().numpy())
-                S_blocks = [
-                    [S_GG + sparse_D_s, S_GA],
-                    [S_GA.T,            S_AA]
-                ]
-                S = sp.bmat(S_blocks, format='csc')
-                factor = self.backward_cache[(i,"factor")]
+                factor = self.backward_cache[(i, "factor")]
                 factor.update(S)
                 cached_indices = self.backward_cache[(i, "indices")]
                 cached_indptr = self.backward_cache[(i, "indptr")]
 
-                # Check if structure matches
                 if not (np.array_equal(S.indices, cached_indices) and
                         np.array_equal(S.indptr, cached_indptr)):
-
-                    # DEBUG: Print details to help you find the culprit
                     print(f"ERROR: Sparsity pattern changed at batch index {i}!")
                     print(f"Old nnz: {len(cached_indices)}, New nnz: {len(S.indices)}")
 
@@ -383,7 +384,7 @@ class dQPTH_layer(nn.Module):
                 "agent": i,
                 "t": t,
                 "warm_start_from_previous": self.warm_start_from_previous,
-                "other_factor": self.backward_cache[(i,"factor")]
+                "other_factor": self.backward_cache[(i, "factor")]
             }
 
             # torch.index_select and .values() only work with COO sparse matrices
@@ -453,84 +454,37 @@ class differentiate_QP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dl_dzhat):
-        backward_start_time = time.time()
-        zhats = ctx.zhats.unsqueeze(0)
-        lams = ctx.lams.unsqueeze(0)
-        nus = ctx.nus.unsqueeze(0)
-        scipy_Q = ctx.scipy_Q
         scipy_G = ctx.scipy_G
         scipy_A = ctx.scipy_A
-        slacks = ctx.slacks
         other_factor = ctx.other_factor
-        eps = 1e-8
-        s_safe = torch.clamp(slacks.flatten(), min=eps)
-        lam_safe = torch.clamp(lams.flatten(), min=eps)
 
-        # 2. Calculate the diagonal terms (s / lambda)
-        # Note: QPTH calculates lams/slacks for the RHS, but the MATRIX needs slacks/lams
-        d_vals = s_safe / lam_safe
-        # 3. Create the sparse diagonal matrix
-        # This goes into your Schur Complement calculation
-        sparse_D_s = sp.diags(d_vals.numpy())
-
-        # 1. Invert Q (trivial since diagonal)
-        # Add eps to ensure stability
+        # Q is diagonal, so 1/Q is a vector and "Q_inv @ v" is an elementwise scale.
         eps = 1e-7
-        Q_diag = scipy_Q.diagonal()
-        Q_inv_diag = 1.0 / (Q_diag + eps)
-        Q_inv = sp.diags(Q_inv_diag)
+        Q_inv_diag = 1.0 / (ctx.scipy_Q.diagonal() + eps)
 
-        # 2. Pre-calculate Q_inv * Transposes (used in assembly and recovery)
-        # Doing this once saves time
-        invQ_GT = Q_inv @ scipy_G.T
-        invQ_AT = Q_inv @ scipy_A.T
+        # RHS for the Schur system. Eliminating dx gives
+        #   rhs_schur = [-G Q_inv rhs_x ; -A Q_inv rhs_x].
+        if torch.is_tensor(dl_dzhat):
+            rhs_x_np = dl_dzhat.detach().cpu().numpy()
+        else:
+            rhs_x_np = np.asarray(dl_dzhat)
+        invQ_rhs_x = Q_inv_diag * rhs_x_np
+        rhs_schur = np.concatenate([
+            -(scipy_G @ invQ_rhs_x),
+            -(scipy_A @ invQ_rhs_x),
+        ])
 
-        # 3. Form the Schur Complement Blocks
-        # Block 1,1: G * Q_inv * G^T + D_s
-        S_GG = scipy_G @ invQ_GT + sparse_D_s
-
-        # Block 1,2: G * Q_inv * A^T
-        S_GA = scipy_G @ invQ_AT
-
-        # Block 2,2: A * Q_inv * A^T (Equalities usually have 0 on diagonal, so we just start with this)
-        S_AA = scipy_A @ invQ_AT
-        # Assemble the full Schur Matrix S
-        S_blocks = [
-            [S_GG, S_GA],
-            [S_GA.T, S_AA]
-        ]
-        S = sp.bmat(S_blocks, format='csc')
-
-        # 4. Form the RHS for the Schur system
-        # We eliminate dx, so the new RHS depends on rhs_x
-        # rhs_schur_1 = rhs_lam - G * Q_inv * rhs_x
-        # rhs_schur_2 = rhs_nu  - A * Q_inv * rhs_x
-        invQ_rhs_x = Q_inv @ dl_dzhat # Vector op
-        rhs_schur_lam = -scipy_G @ invQ_rhs_x
-        rhs_schur_nu  = -scipy_A @ invQ_rhs_x
-        rhs_schur = np.concatenate([rhs_schur_lam, rhs_schur_nu])
-
-        # 5. Solve for Dual Variables (dlam, dnu)
-        # S is Symmetric. If D_s and Q are positive, S is Positive Definite.
-        # You can use splu (LU) or try minres if it's large.
-        factor = qdldl.Solver(S)
-        d_dual = factor.solve(rhs_schur)
-        d_dual2 = other_factor.solve(rhs_schur)
+        # The Schur factor was already built (or updated) for this timestep
+        # in setup_diff and stashed in ctx.other_factor, so reuse it rather
+        # than rebuilding S = [[GQ^-1 G^T + D_s, GQ^-1 A^T],
+        #                     [AQ^-1 G^T,        AQ^-1 A^T]] and re-factoring.
+        d_dual = other_factor.solve(rhs_schur)
         n_ineq = scipy_G.shape[0]
-        dlam = torch.tensor(d_dual[:n_ineq])
-        dlam = dlam.unsqueeze(0)
-        dnu  = torch.tensor(d_dual[n_ineq:])
-        dnu = dnu.unsqueeze(0)
+        dhs = torch.tensor(-d_dual[:n_ineq])
+        dbs = torch.tensor(-d_dual[n_ineq:])
 
-        # For our project, we only need dhs and dbs, calculating other gradients is expensive
-        dQs = None
-        dps = None
-        dGs = None
-        dhs = -dlam.mean(0)
-        dAs = None
-        dbs = -dnu.mean(0)
-        grads = (dQs, dps, dGs, dhs, dAs, dbs, None)
-        return grads
+        # Only dhs and dbs are needed for our use case; the others are skipped.
+        return (None, None, None, dhs, None, dbs, None)
 
 
 def build_settings(check_PSD=False,time=False,solve_type="dense",dual_available=None,normalize_constraints=False,empty_batch=True,warm_start_from_previous=False,omp_parallel=False,n_cpu=None, # general arguments
