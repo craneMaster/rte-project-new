@@ -10,51 +10,86 @@ np.random.seed(0)
 torch.manual_seed(0)
 
 class Base_Controller(nn.Module):
-    """Controller for a designated grid area; considers only buses and lines within that area.
+    """Represents one controller that must decide on actions for its corresponding area. Each controller only has
+    access to the state of the lines and buses in its corresponding area. Only considers buses and lines in its own area.
 
     Attributes:
-        grid (Grid): Full grid that the agent runs on.
-        buses_in_area (list): Bus numbers in this controller's area.
-        lines_in_area (list): Line indices in this controller's area.
-        bus_with_curt (torch.Tensor): Bus numbers with curtailable generation.
-        bus_with_batt (torch.Tensor): Bus numbers with a battery.
-        num_buses (int): Number of buses in area.
-        num_lines (int): Number of lines in area.
-        num_curt (int): Number of curtailable generators in area.
-        num_batt (int): Number of batteries in area.
-        curt_idx (torch.Tensor): Indices for curtailment buses within full grid arrays.
-        batt_idx (torch.Tensor): Indices for battery buses within full grid arrays.
-        delta_t (float): Time between grid updates.
-        state_batt_charge_idx (torch.Tensor): Indices for battery charges in state vector.
-        state_curt_idx (torch.Tensor): Indices for curtailment in state vector.
-        H_x (torch.Tensor): Matrix for bus state inequality constraints, H_x @ x <= H_limit.
-        H_limit (torch.Tensor): RHS vector for bus state inequality constraints.
-        batt_cost (float): Weight on battery charge deviation from target.
-        curt_net_cost (float): Weight on net curtailment.
-        curt_change_cost (float): Weight on curtailment changes.
-        bus_slack_cost (float): Penalty on bus slack variables.
-        line_slack_cost (float): Penalty on line slack variables.
+    state: grid state in the agent's corresponding area
+    grid: (Grid object) full grid that the agent runs on
+    buses_in_area: (list) numbers of buses in the agent's designated area
+    lines_in_area: (list) indices of lines in the agent's designated area
+    bus_with_curt: (numpy array) list of bus numbers with curtailable generation
+    bus_with_batt: (numpy array) list of bus numbers with a battery
+    num_buses: (int)
+    num_lines: (int)
+    num_curt: (int)
+    num_batt: (int)
+    curt_idx: (list) slice indices for retrieving generation buses in agent's area from full area
+    batt_idx: (list) slice indices for retrieving battery buses in agent's area from full area
+    state_idx: (list) slice indices for retrieving state of agent's area from full state
+    delta_t: (int) time between grid updates
+    state_batt_charge_idx (Slice object):
+        Indices for getting battery charges from overall state vector.
+    state_curt_idx (Slice object):
+        Indices for getting curtailment from overall state vector.
+
+    # constraints and dynamics
+    M_curt: (numpy array)
+    M_batt: (numpy array)
+    M_noise: (numpy array)
+    B_curt: (numpy array)
+    B_batt: (numpy array)
+    B_noise: (numpy array)
+    H_x: (numpy array)
+    H_curt: (numpy array)
+    H_batt: (numpy array)
+    H_limit: (numpy array)
+
+    # costs
+    target_charge: (numpy array (num_batt,)) desired battery charges
+    batt_cost: (float) weight factor for cost associated with deviation from desired battery charge
+    curt_net_cost: (float) weight factor for net curtailment cost
+    curt_change_cost: (float) weight factor for changes in curtailment
+    bus_slack_cost (float):
+        Penalty associated with bus slack variables that can be set in optimization.
+    line_slack_cost (float):
+        Penalty associated with line slack variables that can be set in optimization.
+    line_terminal_cost (float):
+        Weight on squared deviation of terminal horizon line flows from the nominal construction baseline.
+    batt_curt_terminal_cost (float):
+        Weight on squared deviation of terminal horizon battery charges and net curtailments
+        from their initial episode values.
     """
 
     def __init__(self, grid, H, buses_in_area, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
-                 eps=1e-8):
+                 line_terminal_cost=0.0, batt_curt_terminal_cost=0.0, eps=1e-8):
         """
         Args:
-            grid (Grid): Full grid that the agent runs on.
-            H (int): MPC prediction horizon length.
-            buses_in_area (torch.Tensor): Bus numbers in this controller's designated area.
-            batt_cost (float): Cost on battery charge deviation from target. Must be non-negative.
-            curt_change_cost (float): Cost on changes in curtailed power. Must be non-negative.
-            curt_net_cost (float): Cost on net curtailed power. Must be non-negative.
-            bus_slack_cost (float): Bus slack penalty. Must be non-negative.
-            line_slack_cost (float): Line slack penalty. Must be non-negative.
-            eps (float): Regularization coefficient ensuring the QP is positive definite.
+            grid (Grid):
+                Full grid that the agent runs on.
+            H (int):
+                MPC prediction horizon length.
+            buses_in_area (Torch matrix of shape (num_buses)):
+                List of all bus numbers in this controller's designated area.
+            batt_cost (Double):
+                Cost on deviation of battery charge from target value. Must be non-negative.
+            curt_change_cost (Double):
+                Cost on changing amount of power curtailed at a bus. Must be non-negative.
+            curt_net_cost (Double):
+                Cost on net amount of power curtailed at a bus. Must be non-negative.
+            slack_cost (Double):
+                Penalty associated with slack variables that can be set in optimization. Must be non-negative.
+            eps (Double):
+                Regularization coefficient. Ensures QP is positive definite.
+        Returns:
+            None
         """
         super().__init__()
         self.grid = grid
         self.H = H
         self.buses_in_area = buses_in_area
         self.eps = eps
+        self.control_delay = grid.control_delay
 
         if batt_cost < 0:
             raise ValueError(f"batt_cost {batt_cost} is negative.")
@@ -66,12 +101,18 @@ class Base_Controller(nn.Module):
             raise ValueError(f"bus_slack_cost {bus_slack_cost} is negative.")
         if line_slack_cost < 0:
             raise ValueError(f"line_slack_cost {line_slack_cost} is negative.")
+        if line_terminal_cost < 0:
+            raise ValueError(f"line_terminal_cost {line_terminal_cost} is negative.")
+        if batt_curt_terminal_cost < 0:
+            raise ValueError(f"batt_curt_terminal_cost {batt_curt_terminal_cost} is negative.")
 
         self.batt_cost = batt_cost
         self.curt_change_cost = curt_change_cost
         self.curt_net_cost = curt_net_cost
         self.bus_slack_cost = bus_slack_cost
         self.line_slack_cost = line_slack_cost
+        self.line_terminal_cost = line_terminal_cost
+        self.batt_curt_terminal_cost = batt_curt_terminal_cost
 
         # ---------------- Determine which grid components belong in this controller's region ----------------
         lines_in_area = list()
@@ -170,11 +211,166 @@ class Base_Controller(nn.Module):
         self.line_B_noise = self.grid.B_noise[self.lines_in_area.unsqueeze(1),self.buses_in_area.unsqueeze(0)]
         self.line_upper_limits = self.grid.line_data[self.lines_in_area,5]
         self.line_lower_limits = -self.grid.line_data[self.lines_in_area,5]
+        # Nominal construction baseline for terminal line-flow cost (fixed; not updated on handoff).
+        self.initial_line_flows = self.grid.baseline_init_state[self.lines_in_area].clone()
+        self.initial_batt_charges = self.grid.init_state[self.grid.state_batt_charge_idx][self.batt_idx].clone()
+        self.initial_curtailments = self.grid.init_state[self.grid.state_curt_idx][self.curt_idx].clone()
+
+
+    def _terminal_cost_q_mask(self):
+        """Boolean mask of QP decision indices that carry terminal regularization costs."""
+        mask = torch.zeros(self.z_dim, dtype=torch.bool)
+        if self.line_terminal_cost > 0:
+            terminal_step = self.H - 1
+            idx = self.line_state_start_idx + terminal_step * self.line_state_dim
+            mask[idx:idx + self.line_state_dim] = True
+        if self.batt_curt_terminal_cost > 0:
+            terminal_step = self.H - 1
+            base_idx = terminal_step * self.bus_state_dim
+            mask[base_idx:base_idx + self.num_batt] = True
+            curt_idx = base_idx + 2 * self.num_batt
+            mask[curt_idx:curt_idx + self.num_curt] = True
+        return mask
+
+    def _qp_cost_scale_denom(self, raw_q):
+        """Per-variable cost normalizers; terminal terms use their own scale so user weights are effective."""
+        terminal_mask = self._terminal_cost_q_mask()
+        running_raw = raw_q.masked_fill(terminal_mask, 0.0)
+        cost_scale = torch.max(torch.abs(running_raw))
+        if float(cost_scale) == 0.0:
+            cost_scale = raw_q.new_tensor(1.0)
+        scale_denom = torch.full((self.z_dim,), float(cost_scale), dtype=raw_q.dtype, device=raw_q.device)
+        if terminal_mask.any():
+            term_scale = torch.max(torch.abs(raw_q[terminal_mask]))
+            if float(term_scale) == 0.0:
+                term_scale = cost_scale
+            scale_denom[terminal_mask] = term_scale
+        return scale_denom
+
+
+    def _add_terminal_line_flow_cost(self, true_cost_vec, target_vec):
+        """Penalize terminal horizon line flows deviating from the nominal construction baseline."""
+        if self.line_terminal_cost <= 0:
+            return
+        terminal_step = self.H - 1
+        idx = self.line_state_start_idx + terminal_step * self.line_state_dim
+        true_cost_vec[idx:idx + self.line_state_dim] = self.line_terminal_cost
+        target_vec[idx:idx + self.line_state_dim] = self.initial_line_flows
+
+    def mpc_terminal_line_flow_cost(self, line_states):
+        """MPC terminal cost on predicted horizon-end line flows vs nominal construction baseline."""
+        if self.line_terminal_cost <= 0:
+            return line_states.new_zeros(())
+        terminal_line = line_states[self.H - 1]
+        return self.line_terminal_cost * torch.sum((terminal_line - self.initial_line_flows) ** 2)
+
+    def _add_terminal_batt_curt_cost(self, true_cost_vec, target_vec):
+        """Penalize terminal horizon battery charges and net curtailments vs episode-start values."""
+        if self.batt_curt_terminal_cost <= 0:
+            return
+        terminal_step = self.H - 1
+        base_idx = terminal_step * self.bus_state_dim
+        batt_idx = base_idx
+        true_cost_vec[batt_idx:batt_idx + self.num_batt] = self.batt_curt_terminal_cost
+        target_vec[batt_idx:batt_idx + self.num_batt] = self.initial_batt_charges
+        curt_idx = base_idx + 2 * self.num_batt
+        true_cost_vec[curt_idx:curt_idx + self.num_curt] = self.batt_curt_terminal_cost
+        target_vec[curt_idx:curt_idx + self.num_curt] = self.initial_curtailments
+
+    def mpc_terminal_batt_curt_cost(self, bus_states):
+        """MPC terminal cost on predicted horizon-end battery/curtailment states vs initial values."""
+        if self.batt_curt_terminal_cost <= 0:
+            return bus_states.new_zeros(())
+        terminal_bus = bus_states[self.H - 1]
+        batt_term = terminal_bus[self.bus_state_batt_charge_idx]
+        curt_term = terminal_bus[self.bus_state_curt_idx]
+        return self.batt_curt_terminal_cost * (
+            torch.sum((batt_term - self.initial_batt_charges) ** 2)
+            + torch.sum((curt_term - self.initial_curtailments) ** 2)
+        )
+
+    def mpc_terminal_cost(self, bus_states, line_states):
+        """Total MPC terminal cost for this controller."""
+        return self.mpc_terminal_line_flow_cost(line_states) + self.mpc_terminal_batt_curt_cost(bus_states)
+
+    def _couple_bus_actions_to_dynamics_row(self, block_row, state_step):
+        """Couple horizon actions to bus-state dynamics with control_delay offset."""
+        action_step = state_step - self.control_delay
+        if action_step < 0:
+            return
+        action_batt_idx = action_step * self.num_batt + self.action_batt_start_idx
+        action_curt_idx = action_step * self.num_curt + self.action_curt_start_idx
+        block_row[:, action_batt_idx:action_batt_idx + self.num_batt] = -self.bus_B_batt
+        block_row[:, action_curt_idx:action_curt_idx + self.num_curt] = -self.bus_B_curt
+
+
+    def _couple_line_actions_to_dynamics_row(self, block_row, state_step):
+        """Couple horizon actions to line-state dynamics with control_delay offset."""
+        action_step = state_step - self.control_delay
+        if action_step < 0:
+            return
+        action_batt_idx = action_step * self.num_batt + self.action_batt_start_idx
+        action_curt_idx = action_step * self.num_curt + self.action_curt_start_idx
+        block_row[:, action_batt_idx:action_batt_idx + self.num_batt] = -self.line_B_batt
+        block_row[:, action_curt_idx:action_curt_idx + self.num_curt] = -self.line_B_curt
+
+
+    def _past_action_bus_rhs(self, state_step):
+        if state_step >= self.control_delay:
+            return torch.zeros(self.bus_state_dim)
+        past_curt, past_batt = self.grid.get_past_actions(state_step)
+        local_past_curt = past_curt[self.curt_idx]
+        local_past_batt = past_batt[self.batt_idx]
+        return self.bus_B_curt @ local_past_curt + self.bus_B_batt @ local_past_batt
+
+
+    def _past_action_line_rhs(self, state_step):
+        if state_step >= self.control_delay:
+            return torch.zeros(self.line_state_dim)
+        past_curt, past_batt = self.grid.get_past_actions(state_step)
+        local_past_curt = past_curt[self.curt_idx]
+        local_past_batt = past_batt[self.batt_idx]
+        return self.line_B_curt @ local_past_curt + self.line_B_batt @ local_past_batt
+
+
+    def _fill_cost_target_vec(self, target_vec):
+        """Populate deviation targets for quadratic costs that depend on episode-start references."""
+        for i in range(self.H):
+            idx = i * self.bus_state_dim
+            target_vec[idx:idx + self.num_batt] = self.grid.target_batt_charges[self.batt_idx]
+
+        if self.line_terminal_cost > 0:
+            terminal_step = self.H - 1
+            idx = self.line_state_start_idx + terminal_step * self.line_state_dim
+            target_vec[idx:idx + self.line_state_dim] = self.initial_line_flows
+
+        if self.batt_curt_terminal_cost > 0:
+            terminal_step = self.H - 1
+            base_idx = terminal_step * self.bus_state_dim
+            target_vec[base_idx:base_idx + self.num_batt] = self.initial_batt_charges
+            curt_idx = base_idx + 2 * self.num_batt
+            target_vec[curt_idx:curt_idx + self.num_curt] = self.initial_curtailments
+
+    def _apply_cost_linear_terms(self, target_vec):
+        """Recompute q/const/scaled_q from current deviation targets."""
+        true_cost_vec = self.true_cost_vec
+        raw_q = 2 * self.scale_vec * true_cost_vec * self.scale_vec
+        scale_denom = self._qp_cost_scale_denom(raw_q)
+        inv_scale = 1.0 / scale_denom
+        self.q = -2 * true_cost_vec * target_vec * inv_scale
+        self.const = torch.sum(true_cost_vec * target_vec ** 2 * inv_scale)
+        self.scaled_q = self.scale_vec * self.q
+
+    def update_cost_targets(self):
+        """Refresh MPC linear cost terms after episode-start references change."""
+        target_vec = torch.zeros(self.z_dim)
+        self._fill_cost_target_vec(target_vec)
+        self._apply_cost_linear_terms(target_vec)
 
 
     def init_matrices(self):
         # ----------------------------------------------------------------------------------------
-        # aggregate vector is bus state, bus slack, line state, line max slack, line min slack, batt action, curt action
+        # aggregate vector is bus state, line state, line max slack, line min slack, batt action, curt action
         self.z_dim = self.H * (self.bus_state_dim + self.line_state_dim + self.line_max_slack_dim \
                             + self.line_min_slack_dim + self.num_batt + self.num_curt)
         self.eq_dim = self.H * (self.bus_state_dim + self.line_state_dim)
@@ -197,7 +393,7 @@ class Base_Controller(nn.Module):
             true_cost_vec[idx:idx+self.num_batt] = self.batt_cost * torch.ones(self.num_batt)
             target_vec[idx:idx+self.num_batt] = self.grid.target_batt_charges[self.batt_idx]
 
-            # net curtailment costs
+            # net curtailment costs (penalize absolute curtailment level toward zero)
             idx = i * self.bus_state_dim + 2 * self.num_batt
             true_cost_vec[idx:idx+self.num_curt] = self.curt_net_cost * torch.ones(self.num_curt)
 
@@ -212,6 +408,9 @@ class Base_Controller(nn.Module):
         # line min slack costs
         idx = self.line_min_slack_start_idx
         true_cost_vec[idx:idx+self.H*self.line_min_slack_dim] = self.line_slack_cost * torch.ones(self.H*self.line_min_slack_dim)
+
+        self._add_terminal_line_flow_cost(true_cost_vec, target_vec)
+        self._add_terminal_batt_curt_cost(true_cost_vec, target_vec)
 
         self.true_cost_vec = true_cost_vec
 
@@ -228,8 +427,7 @@ class Base_Controller(nn.Module):
             if not i == 0:
                 block_row[:,(i-1)*self.bus_state_dim:i*self.bus_state_dim] = -self.bus_A
             block_row[:,i*self.bus_state_dim:(i+1)*self.bus_state_dim] = torch.eye(self.bus_state_dim)
-            block_row[:,action_batt_idx:action_batt_idx+self.num_batt] = -self.bus_B_batt
-            block_row[:,action_curt_idx:action_curt_idx+self.num_curt] = -self.bus_B_curt
+            self._couple_bus_actions_to_dynamics_row(block_row, i)
 
             row_idx = i * self.bus_state_dim
             self.A[row_idx:row_idx+self.bus_state_dim] = block_row
@@ -244,8 +442,7 @@ class Base_Controller(nn.Module):
             if not i == 0:
                 block_row[:,idx-self.line_state_dim:idx] = -torch.eye(self.line_state_dim)
             block_row[:,idx:idx+self.line_state_dim] = torch.eye(self.line_state_dim)
-            block_row[:,action_batt_idx:action_batt_idx+self.num_batt] = -self.line_B_batt
-            block_row[:,action_curt_idx:action_curt_idx+self.num_curt] = -self.line_B_curt
+            self._couple_line_actions_to_dynamics_row(block_row, i)
 
             row_idx = i * self.line_state_dim + self.H * self.bus_state_dim
             self.A[row_idx:row_idx+self.line_state_dim] = block_row
@@ -348,13 +545,13 @@ class Base_Controller(nn.Module):
         self.F_vec = F_vec
         raw_q = 2 * scale_vec * true_cost_vec * scale_vec
 
-        cost_scale = torch.max(torch.abs(raw_q))
-        
-        ridge_eps = 1e-8 * cost_scale
-        
-        q_vec = ((2 * scale_vec * true_cost_vec * scale_vec) + ridge_eps * torch.ones(self.z_dim)) / cost_scale
-        self.q = -2 * torch.diag(true_cost_vec) @ target_vec / cost_scale   # slack and ridge cost have linear term 0
-        self.const = target_vec @ torch.diag(true_cost_vec) @ target_vec / cost_scale
+        scale_denom = self._qp_cost_scale_denom(raw_q)
+        ridge_eps = 1e-8 * scale_denom
+
+        q_vec = (raw_q + ridge_eps) / scale_denom
+        inv_scale = 1.0 / scale_denom
+        self.q = -2 * true_cost_vec * target_vec * inv_scale
+        self.const = torch.sum(true_cost_vec * target_vec ** 2 * inv_scale)
         
         self.q_vec = q_vec
         self.scaled_Q = torch.diag(q_vec)
@@ -377,32 +574,64 @@ class Base_Controller(nn.Module):
 
 
     def update_line_state(self):
-        """Fetches line state from the overall Grid object."""
+        """
+        Fetches line state from the overall Grid object.
+
+        Args:
+            None
+        Returns:
+            None
+        """
         self.line_state = self.grid.state[self.grid_state_line_state_idx]
 
 
     def update_bus_state(self):
-        """Fetches bus state from the overall Grid object."""
+        """
+        Fetches bus state from the overall Grid object.
+
+        Args:
+            None
+        Returns:
+            None
+        """
         self.bus_state = self.grid.state[self.grid_state_bus_state_idx]
 
 
     def get_matrices_dQPTH(self, disturbances, t):
-        """Returns the QP matrices for this controller given current disturbance predictions.
+        """
+        Returns copy of the matrices that would be passed to QPTH.
 
         Args:
-            disturbances (torch.Tensor): Shape (H, num_buses); power injection noise predictions per bus.
-            t (int): Current timestep.
-
+            disturbances (Torch tensor of shape (H, num_buses)):
+                Predictions of power injection noise at each bus in each controller's designated area.
+            t (int):
+                Current timestep.
         Returns:
-            dict: QP matrices with keys: csc_scaled_Q, csc_scaled_G, csc_scaled_A, scipy_scaled_Q,
-                scipy_scaled_G, scipy_scaled_A, Q, q, A, b, G, h, const.
+            dQPTH_config (dict): Contains matrices and vectors that would be passed to QPTH, keys are:
+                Q (Torch tensor of shape (self.z_dim, self.z_dim)):
+                    Matrix describing the quadratic cost component
+                q (Torch tensor of shape (self.z_dim)):
+                    Vector describing the linear cost component
+                A (Torch tensor of shape (self.eq_dim, self.z_dim)):
+                    Matrix associated with the equality constraint
+                b (Torch tensor of shape (self.eq_dim)):
+                    Vector associated with the equality constraint
+                G (Torch tensor of shape (self.ineq_dim, self.z_dim)):
+                    Matrix associated with the inequality constraint
+                h (Torch tensor of shape (self.ineq_dim)):
+                    Vector associated with the inequality constraint
         """
         b = torch.zeros(self.eq_dim)
         b[0:self.bus_state_dim] = self.bus_A @ self.bus_state
 
         for i in range(self.H):
+            row_idx = i * self.bus_state_dim
+            b[row_idx:row_idx + self.bus_state_dim] += self._past_action_bus_rhs(i)
+
+        for i in range(self.H):
             row_idx = i * self.line_state_dim + self.H * self.bus_state_dim
             b[row_idx:row_idx+self.line_state_dim] = self.line_B_noise @ disturbances[i]
+            b[row_idx:row_idx+self.line_state_dim] += self._past_action_line_rhs(i)
 
         row_idx = self.H * self.bus_state_dim
         b[row_idx:row_idx+self.line_state_dim] = self.line_state
@@ -482,6 +711,12 @@ class Base_Controller(nn.Module):
                 curt_net_obj += self.curt_net_cost * torch.sum(bus_states[i][self.bus_state_curt_idx]**2)
                 objective += self.line_slack_cost * torch.sum(line_max_slacks[i]**2)
                 objective += self.line_slack_cost * torch.sum(line_min_slacks[i]**2)
+            if self.line_terminal_cost > 0:
+                terminal_line = line_states[self.H - 1]
+                objective += self.line_terminal_cost * torch.sum(
+                    (terminal_line - self.initial_line_flows) ** 2
+                )
+            objective += self.mpc_terminal_batt_curt_cost(bus_states)
             objective += self.eps * torch.sum(norm_squared ** 2)
 
         if update_state:
@@ -501,56 +736,90 @@ def csc_torch_to_scipy(A):
     return csc_matrix((A.values().detach().numpy(),A.row_indices().numpy(),A.ccol_indices().numpy()),shape=A.size())
 
 class Split_Constraint_Controller(Base_Controller):
-    """Controller using the split-constraint framework; considers all grid lines, not just those in its area.
+    """Represents one controller that must decide on actions for its corresponding area. Each controller only has
+    access to the state of the lines and buses in its corresponding area. Implements split constraints. This controller uses the
+    `split constraint' framework and considers its impact on all lines in the grid, and not just those lines in its own area.
 
     Attributes:
-        grid (Grid): Full grid that the agent runs on.
-        buses_in_area (list): Bus numbers in this controller's area.
-        lines_in_area (list): Line indices in this controller's area.
-        bus_with_curt (torch.Tensor): Bus numbers with curtailable generation.
-        bus_with_batt (torch.Tensor): Bus numbers with a battery.
-        num_buses (int): Number of buses in area.
-        num_lines (int): Total number of lines in the full grid (split constraints cover all lines).
-        num_curt (int): Number of curtailable generators in area.
-        num_batt (int): Number of batteries in area.
-        curt_idx (torch.Tensor): Indices for curtailment buses within full grid arrays.
-        batt_idx (torch.Tensor): Indices for battery buses within full grid arrays.
-        delta_t (float): Time between grid updates.
-        line_max_change (nn.Parameter): Learnable per-step max line limit changes over the trajectory.
-        line_min_change (nn.Parameter): Learnable per-step min line limit changes over the trajectory.
-        H_x (torch.Tensor): Matrix for bus state inequality constraints, H_x @ x <= H_limit.
-        H_limit (torch.Tensor): RHS vector for bus state inequality constraints.
-        batt_cost (float): Weight on battery charge deviation from target.
-        curt_net_cost (float): Weight on net curtailment.
-        curt_change_cost (float): Weight on curtailment changes.
-        bus_slack_cost (float): Penalty on bus slack variables.
-        line_slack_cost (float): Penalty on line slack variables.
+    state: grid state in the agent's corresponding area
+    grid: (Grid object) full grid that the agent runs on
+    buses_in_area: (list) numbers of buses in the agent's designated area
+    lines_in_area: (list) indices of lines in the agent's designated area
+    bus_with_curt: (numpy array) list of bus numbers with curtailable generation
+    bus_with_batt: (numpy array) list of bus numbers with a battery
+    num_buses: (int)
+    num_lines: (int)
+    num_curt: (int)
+    num_batt: (int)
+    curt_idx: (list) slice indices for retrieving generation buses in agent's area from full area
+    batt_idx: (list) slice indices for retrieving battery buses in agent's area from full area
+    state_idx: (list) slice indices for retrieving state of agent's area from full state
+    delta_t: (int) time between grid updates
+    state_batt_charge_idx (Slice object):
+        Indices for getting battery charges from overall state vector.
+    state_curt_idx (Slice object):
+        Indices for getting curtailment from overall state vector.
+
+    # constraints and dynamics
+    M_curt: (numpy array)
+    M_batt: (numpy array)
+    M_noise: (numpy array)
+    B_curt: (numpy array)
+    B_batt: (numpy array)
+    B_noise: (numpy array)
+    H_x: (numpy array)
+    H_curt: (numpy array)
+    H_batt: (numpy array)
+    H_limit: (numpy array)
+
+    # costs
+    target_charge: (numpy array (num_batt,)) desired battery charges
+    batt_cost: (float) weight factor for cost associated with deviation from desired battery charge
+    curt_net_cost: (float) weight factor for net curtailment cost
+    curt_change_cost: (float) weight factor for changes in curtailment
+    slack_cost (float):
+        Penalty associated with slack variables that can be set in optimization.
     """
 
     def __init__(self, grid, H, buses_in_area, init_line_max, init_line_min, batt_cost, curt_change_cost,
-                 curt_net_cost, bus_slack_cost, line_slack_cost, eps=1e-8):
+                 curt_net_cost, bus_slack_cost, line_slack_cost, line_terminal_cost=0.0,
+                 batt_curt_terminal_cost=0.0, eps=1e-8):
         """
         Args:
-            grid (Grid): Full grid that the agent runs on.
-            H (int): MPC prediction horizon length.
-            buses_in_area (torch.Tensor): Bus numbers in this controller's designated area.
-            init_line_max (torch.Tensor): Shape (T, num_lines); initial max line limit changes per step.
-            init_line_min (torch.Tensor): Shape (T, num_lines); initial min line limit changes per step.
-            batt_cost (float): Cost on battery charge deviation from target. Must be non-negative.
-            curt_change_cost (float): Cost on changes in curtailed power. Must be non-negative.
-            curt_net_cost (float): Cost on net curtailed power. Must be non-negative.
-            bus_slack_cost (float): Bus slack penalty. Must be non-negative.
-            line_slack_cost (float): Line slack penalty. Must be non-negative.
-            eps (float): Regularization coefficient ensuring the QP is positive definite.
+            grid (Grid):
+                Full grid that the agent runs on.
+            H (int):
+                MPC prediction horizon length.
+            buses_in_area (Torch matrix of shape (num_buses)):
+                List of all bus numbers in this controller's control area.
+            init_line_max (Torch matrix of shape (T+H, grid.num_lines)):
+                Initial max line limits across entire trajectory.
+            init_line_min (Torch matrix of shape (T+H, grid.num_lines)):
+                Initial min line limits across entire trajectory.
+            batt_cost (Double):
+                Cost on deviation of battery charge from target value. Must be non-negative.
+            curt_change_cost (Double):
+                Cost on changing amount of power curtailed at a bus. Must be non-negative.
+            curt_net_cost (Double):
+                Cost on net amount of power curtailed at a bus. Must be non-negative.
+            bus_slack_cost (Double):
+                Penalty associated with bus slack variables that can be set in optimization. Must be non-negative.
+            line_slack_cost (Double):
+                Penalty associated with line slack variables that can be set in optimization. Must be non-negative.
+            eps (Double):
+                Regularization coefficient. Ensures QP is positive definite.
+        Returns:
+            None
         """
         super().__init__(grid, H, buses_in_area, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
-                         eps=eps)
+                         line_terminal_cost=line_terminal_cost, batt_curt_terminal_cost=batt_curt_terminal_cost, eps=eps)
         self.register_buffer("init_line_max_change_buf", init_line_max.clone())
         self.register_buffer("init_line_min_change_buf", init_line_min.clone())
         self.line_max_change = nn.Parameter(self.init_line_max_change_buf.clone())
         self.line_min_change = nn.Parameter(self.init_line_min_change_buf.clone())
         self.line_state_dim = self.grid.num_lines
         self.line_state = torch.zeros(self.line_state_dim)
+        self.initial_line_flows = self.grid.baseline_init_state[self.grid.state_line_flow_idx].clone()
         self.bus_ineq_dim = 2 * self.bus_state_dim
         self.line_max_slack_dim = self.line_state_dim
         self.line_min_slack_dim = self.line_state_dim
@@ -559,7 +828,7 @@ class Split_Constraint_Controller(Base_Controller):
         self.line_B_batt = self.grid.B_batt[0:self.grid.num_lines,self.batt_idx]
         self.line_B_noise = self.grid.B_noise[0:self.grid.num_lines,self.buses_in_area]
         # ----------------------------------------------------------------------------------------
-        # aggregate vector is bus state, bus slack, line state, line max slack, line min slack, batt action, curt action
+        # aggregate vector is bus state, line state, line max slack, line min slack, batt action, curt action
         self.z_dim = H * (self.bus_state_dim + self.line_state_dim + self.line_max_slack_dim \
                             + self.line_min_slack_dim + self.num_batt + self.num_curt)
         self.eq_dim = H * (self.bus_state_dim + self.line_state_dim)
@@ -582,7 +851,7 @@ class Split_Constraint_Controller(Base_Controller):
             true_cost_vec[idx:idx+self.num_batt] = batt_cost * torch.ones(self.num_batt)
             target_vec[idx:idx+self.num_batt] = self.grid.target_batt_charges[self.batt_idx]
 
-            # net curtailment costs
+            # net curtailment costs (penalize absolute curtailment level toward zero)
             idx = i * self.bus_state_dim + 2 * self.num_batt
             true_cost_vec[idx:idx+self.num_curt] = curt_net_cost * torch.ones(self.num_curt)
 
@@ -597,6 +866,9 @@ class Split_Constraint_Controller(Base_Controller):
         # line min slack costs
         idx = self.line_min_slack_start_idx
         true_cost_vec[idx:idx+H*self.line_min_slack_dim] = line_slack_cost * torch.ones(H*self.line_min_slack_dim)
+
+        self._add_terminal_line_flow_cost(true_cost_vec, target_vec)
+        self._add_terminal_batt_curt_cost(true_cost_vec, target_vec)
 
         self.true_cost_vec = true_cost_vec
 
@@ -613,8 +885,7 @@ class Split_Constraint_Controller(Base_Controller):
             if not i == 0:
                 block_row[:,(i-1)*self.bus_state_dim:i*self.bus_state_dim] = -self.bus_A
             block_row[:,i*self.bus_state_dim:(i+1)*self.bus_state_dim] = torch.eye(self.bus_state_dim)
-            block_row[:,action_batt_idx:action_batt_idx+self.num_batt] = -self.bus_B_batt
-            block_row[:,action_curt_idx:action_curt_idx+self.num_curt] = -self.bus_B_curt
+            self._couple_bus_actions_to_dynamics_row(block_row, i)
 
             row_idx = i * self.bus_state_dim
             self.A[row_idx:row_idx+self.bus_state_dim] = block_row
@@ -629,8 +900,7 @@ class Split_Constraint_Controller(Base_Controller):
             if not i == 0:
                 block_row[:,idx-self.line_state_dim:idx] = -torch.eye(self.line_state_dim)
             block_row[:,idx:idx+self.line_state_dim] = torch.eye(self.line_state_dim)
-            block_row[:,action_batt_idx:action_batt_idx+self.num_batt] = -self.line_B_batt
-            block_row[:,action_curt_idx:action_curt_idx+self.num_curt] = -self.line_B_curt
+            self._couple_line_actions_to_dynamics_row(block_row, i)
 
             row_idx = i * self.line_state_dim + H * self.bus_state_dim
             self.A[row_idx:row_idx+self.line_state_dim] = block_row
@@ -733,13 +1003,13 @@ class Split_Constraint_Controller(Base_Controller):
         self.F_vec = F_vec
         raw_q = 2 * scale_vec * true_cost_vec * scale_vec
 
-        cost_scale = torch.max(torch.abs(raw_q))
-        ridge_eps = 1e-8 * cost_scale
-        
-        q_vec = ((2 * scale_vec * true_cost_vec * scale_vec) + ridge_eps * torch.ones(self.z_dim)) / cost_scale
-        # print(torch.min(q_vec), torch.max(q_vec))
-        self.q = -2 * true_cost_vec * target_vec / cost_scale   # slack and ridge cost have linear term 0
-        self.const = target_vec @ (true_cost_vec * target_vec) / cost_scale
+        scale_denom = self._qp_cost_scale_denom(raw_q)
+        ridge_eps = 1e-8 * scale_denom
+
+        q_vec = (raw_q + ridge_eps) / scale_denom
+        inv_scale = 1.0 / scale_denom
+        self.q = -2 * true_cost_vec * target_vec * inv_scale
+        self.const = torch.sum(true_cost_vec * target_vec ** 2 * inv_scale)
         
         self.q_vec = q_vec
         self.scaled_Q = torch.diag(q_vec)
@@ -760,13 +1030,43 @@ class Split_Constraint_Controller(Base_Controller):
         self.scipy_scaled_A = csc_torch_to_scipy(self.csc_scaled_A)
 
 
+    def _apply_cost_linear_terms(self, target_vec):
+        """Recompute q/const/scaled_q from current deviation targets."""
+        true_cost_vec = self.true_cost_vec
+        raw_q = 2 * self.scale_vec * true_cost_vec * self.scale_vec
+        scale_denom = self._qp_cost_scale_denom(raw_q)
+        inv_scale = 1.0 / scale_denom
+        self.q = -2 * true_cost_vec * target_vec * inv_scale
+        self.const = torch.sum(true_cost_vec * target_vec ** 2 * inv_scale)
+        self.scaled_q = self.scale_vec * self.q
+
+
+    def update_line_state(self):
+        """Fetch all grid line flows (split constraints track every line, not just the local partition)."""
+        self.line_state = self.grid.state[self.grid.state_line_flow_idx]
+
+
     def zero_line_state(self):
-        """Sets line states to all zeros."""
+        """
+        Sets line states to all zeros.
+
+        Args:
+            None
+        Returns:
+            None
+        """
         self.line_state = torch.zeros_like(self.line_state)
 
 
     def reset_params(self):
-        """Resets split constraint parameters to their initial values."""
+        """
+        Resets split constraint parameters to values they were origianlly initialized to.
+
+        Args:
+            None
+        Returns:
+            None
+        """
         self.line_max_change = nn.Parameter(self.init_line_max_change_buf.clone())
         self.line_min_change = nn.Parameter(self.init_line_min_change_buf.clone())
 
@@ -814,6 +1114,12 @@ class Split_Constraint_Controller(Base_Controller):
                 curt_net_obj += self.curt_net_cost * torch.sum(bus_states[i][self.bus_state_curt_idx]**2)
                 objective += self.line_slack_cost * torch.sum(line_max_slacks[i]**2)
                 objective += self.line_slack_cost * torch.sum(line_min_slacks[i]**2)
+            if self.line_terminal_cost > 0:
+                terminal_line = line_states[self.H - 1]
+                objective += self.line_terminal_cost * torch.sum(
+                    (terminal_line - self.initial_line_flows) ** 2
+                )
+            objective += self.mpc_terminal_batt_curt_cost(bus_states)
             objective += self.eps * torch.sum(norm_squared ** 2)
 
         if update_state:
@@ -822,24 +1128,42 @@ class Split_Constraint_Controller(Base_Controller):
 
         return bus_states, line_states, actions_curt, actions_batt, None, line_max_slacks, line_min_slacks, objective
 
-    
+
     def get_matrices_dQPTH(self, disturbances, t):
-        """Returns the QP matrices for this controller given current disturbance predictions.
+        """
+        Returns copy of the matrices that would be passed to QPTH.
 
         Args:
-            disturbances (torch.Tensor): Shape (H, num_buses); power injection noise predictions per bus.
-            t (int): Current timestep.
-
+            disturbances (Torch tensor of shape (H, num_buses)):
+                Predictions of power injection noise at each bus in the Controller control area.
+            t (int):
+                Current timestep.
         Returns:
-            dict: QP matrices with keys: csc_scaled_Q, csc_scaled_G, csc_scaled_A, scipy_scaled_Q,
-                scipy_scaled_G, scipy_scaled_A, Q, q, A, b, G, h, const.
+            dQPTH_config (dict): Contains matrices and vectors that would be passed to QPTH, keys are:
+                Q (Torch tensor of shape (self.z_dim, self.z_dim)):
+                    Matrix describing the quadratic cost component
+                q (Torch tensor of shape (self.z_dim)):
+                    Vector describing the linear cost component
+                A (Torch tensor of shape (self.eq_dim, self.z_dim)):
+                    Matrix associated with the equality constraint
+                b (Torch tensor of shape (self.eq_dim)):
+                    Vector associated with the equality constraint
+                G (Torch tensor of shape (self.ineq_dim, self.z_dim)):
+                    Matrix associated with the inequality constraint
+                h (Torch tensor of shape (self.ineq_dim)):
+                    Vector associated with the inequality constraint
         """
         b = torch.zeros(self.eq_dim)
         b[0:self.bus_state_dim] = self.bus_A @ self.bus_state
 
         for i in range(self.H):
+            row_idx = i * self.bus_state_dim
+            b[row_idx:row_idx + self.bus_state_dim] += self._past_action_bus_rhs(i)
+
+        for i in range(self.H):
             row_idx = i * self.line_state_dim + self.H * self.bus_state_dim
             b[row_idx:row_idx+self.line_state_dim] = self.line_B_noise @ disturbances[i]
+            b[row_idx:row_idx+self.line_state_dim] += self._past_action_line_rhs(i)
 
         row_idx = self.H * self.bus_state_dim
         b[row_idx:row_idx+self.line_state_dim] += self.line_state

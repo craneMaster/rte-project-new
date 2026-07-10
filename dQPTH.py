@@ -237,6 +237,13 @@ class dQPTH_layer(nn.Module):
         self.nu_star_np = [None for _ in range(self.nBatch)]
 
         mp.set_start_method('spawn', force=True)
+        # processes = list()
+
+        # x_vals = []
+        # y_vals = []
+        # z_vals = []
+        # V_basis_vals = []
+        # C_basis_vals = []
 
         # start_time = time.time()
         qp_solve_args = []
