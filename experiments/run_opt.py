@@ -22,9 +22,11 @@ torch.manual_seed(TORCH_SEED)
 def str2bool(s):
     return s.lower() in {"1","true","t","yes","y"}
 
-def build_tag(parser, args, *, sep="_", bool_as_int=False, only_nondefaults=False):
+def build_tag(parser, args, *, skip=("job_id",), sep="_", bool_as_int=False, only_nondefaults=False):
     """
     Create a tag from all argparse args without hard-coding keys.
+
+    - skip: names to exclude (e.g., ("job_id",))
     - sep: separator between parts
     - bool_as_int: if True -> booleans encoded as 1/0; else True/False
     - only_nondefaults: if True -> include only args whose value != default
@@ -33,8 +35,8 @@ def build_tag(parser, args, *, sep="_", bool_as_int=False, only_nondefaults=Fals
         if isinstance(v, bool):
             return ("1" if v else "0") if bool_as_int else str(v)
         if isinstance(v, float):
-            s = f"{v:g}"
-            return s if "." in s else s + ".0"
+            # compact float (no trailing zeros), but keep full precision
+            return f"{v:g}"
         return str(v)
 
     # Build a dict of defaults to optionally filter unchanged values
@@ -48,7 +50,7 @@ def build_tag(parser, args, *, sep="_", bool_as_int=False, only_nondefaults=Fals
     # Use parser._actions to preserve declaration order
     for action in parser._actions:
         dest = getattr(action, "dest", None)
-        if not dest or dest == "help":
+        if not dest or dest == "help" or dest in skip:
             continue
 
         val = getattr(args, dest)
@@ -63,24 +65,26 @@ def build_tag(parser, args, *, sep="_", bool_as_int=False, only_nondefaults=Fals
 def main(args):
     torch.set_default_dtype(torch.double)
     torch.set_printoptions(threshold=10000)
+    io_disable = False
+    # io_disable = not sys.stdout.isatty()
 
     # -------- sweep params --------
-    noise_mag = args.noise_mag
+    ps = args.ps
     offset = args.offset
     test_skew_mag = args.test_skew_mag
     radius = args.radius
+    num_cycles = args.num_cycles
+    job_id = args.job_id
     # ------------------------------
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    ROOT_DIR = os.path.dirname(BASE_DIR)
-    folder = os.path.join(ROOT_DIR, f"results/opt/")
-    tag = build_tag(parser, args, bool_as_int=False, only_nondefaults=False)
-    print(f"Results for this run will be saved at {folder}opt_{tag}.pt")
+    folder = f"paper_experiments/{job_id}/"
+    tag = build_tag(parser, args, skip=("job_id",), bool_as_int=False, only_nondefaults=False)
+    print(f"Checkpoint for this run will be saved at {folder}checkpoint_{tag}.pt")
     os.makedirs(folder, exist_ok=True)
-    
-    line_data_loc = os.path.join(ROOT_DIR, 'data/case118_line_data.pt')
-    bus_data_loc = os.path.join(ROOT_DIR, 'data/case118_bus_data.pt')
-    gen_data_loc = os.path.join(ROOT_DIR, 'data/case118_gen_data.pt')
-    ptdf_data_loc = os.path.join(ROOT_DIR, 'data/case118_ptdf_data.pt')
+
+    line_data_loc = 'data/case118_line_data.pt'
+    bus_data_loc = 'data/case118_bus_data.pt'
+    gen_data_loc = 'data/case118_gen_data.pt'
+    ptdf_data_loc = 'data/case118_ptdf_data.pt'
 
     bus_with_curt = torch.load(gen_data_loc, weights_only=True)[:,0].int()
     num_curt = bus_with_curt.shape[0]
@@ -88,14 +92,12 @@ def main(args):
     num_batt = bus_with_batt.shape[0]
     delta_t = 15
 
-    grid = grid_pkg.Grid(bus_with_curt, bus_with_batt, delta_t, line_data_loc, bus_data_loc, gen_data_loc, ptdf_data_loc)
+    grid = grid_pkg.Grid(bus_with_curt, bus_with_batt, delta_t, line_data_loc, bus_data_loc, gen_data_loc, ptdf_data_loc, control_delay = args.control_delay)
     T = 20
     H = 5
     
-    test_trajs_no_mismatch_loc = os.path.join(ROOT_DIR, f'data/scenario_generation/test_trajs_no_mismatch_rad{radius}.pt')
-    test_trajs_no_mismatch = torch.load(test_trajs_no_mismatch_loc)
-    test_trajs_with_mismatch_loc = os.path.join(ROOT_DIR, f'data/scenario_generation/test_trajs_with_mismatch_rad{radius}/test_trajs_with_mismatch_noise_mag{noise_mag}_offset{offset}_tsm{test_skew_mag}.pt')
-    test_trajs_with_mismatch = torch.load(test_trajs_with_mismatch_loc)
+    train_trajs = torch.load(f'data/scenario_generation/train_trajs_rad{radius}.pt')
+    test_trajs_with_mismatch = torch.load(f'data/scenario_generation/test_trajs_with_mismatch_rad{radius}/test_trajs_with_mismatch_ps{ps}_offset{offset}_tsm{test_skew_mag}.pt')
 
     batt_cost = 100
     curt_change_cost = 0.01
@@ -116,32 +118,44 @@ def main(args):
     for k, v in vars(args).items():
         ckpt[k] = v
 
-    if test_skew_mag == 0:
-        num_test_traj = test_trajs_no_mismatch["num_test_traj"]
-        optimal_losses = torch.zeros(num_test_traj, 3)
-        for i in range(num_test_traj):
-            test_traj = all_test_trajs[i]
-            ckpt_central = evals.get_central_full_traj(grid, T, H, test_traj, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost)
-            optimal_losses[i] = ckpt_central["total_losses"]
-        ckpt[("optimal")] = optimal_losses
-    else:
-        for test_seed in tqdm(range(3)):
-            num_test_traj = test_trajs_with_mismatch["num_test_traj"]
-            all_test_trajs = test_trajs_with_mismatch[(noise_mag, offset, test_skew_mag, test_seed)]
-            optimal_losses = torch.zeros(num_test_traj, 3)
-            for j in tqdm(range(num_test_traj)):
-                test_traj = all_test_trajs[j]
-                ckpt_central = evals.get_central_full_traj(grid, T, H, test_traj, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost)
-                optimal_losses[j] = ckpt_central["total_losses"]
-            ckpt[(test_seed, "optimal")] = optimal_losses
+    num_train_traj = train_trajs["num_train_traj"]
+    num_train_torch_seeds = train_trajs["num_torch_seeds"] // 2
+    num_test_traj = test_trajs_with_mismatch["num_test_traj"]
+    num_test_torch_seeds = test_trajs_with_mismatch["num_torch_seeds"]
 
-    # torch.save(ckpt, f"{folder}checkpoint_{tag}.pt")
+    pool = mp.Pool(processes=num_agents)
+    dqp_eps = 1
+    settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
+    dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
+
+    # for i in range(1):
+    # for i in tqdm(range(num_test_torch_seeds)):
+    for test_seed in tqdm(range(3)):
+        all_test_trajs = test_trajs_with_mismatch[(ps, offset, test_skew_mag, test_seed)]
+        optimal_losses = torch.zeros(num_test_traj,3)
+        # for j in range(1):
+        for j in tqdm(range(num_test_traj)):
+            test_traj = all_test_trajs[j]
+            ckpt_central = evals.get_central_full_traj(
+                grid, T, H, test_traj, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
+                num_cycles=num_cycles)
+            optimal_losses[j] = ckpt_central["total_losses"]
+
+        ckpt[(test_seed, "optimal")] = optimal_losses
+
+    pool.close()
+    print("final save")
+    torch.save(ckpt, f"{folder}checkpoint_{tag}.pt")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--noise_mag", type=float, default=4.0)
-    parser.add_argument("--offset", type=int, default=180)
-    parser.add_argument("--test_skew_mag", type=int, default=20)
+    parser.add_argument("--ps", type=float, default=2.0)
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--test_skew_mag", type=int, default=25)
     parser.add_argument("--radius", type=float, default=0.2)
+    parser.add_argument("--job_id", type=str, default="manual") # <- from Slurm
+    parser.add_argument("--control_delay", type=int, default=1)
+    parser.add_argument("--num_cycles", type=int, default=5,
+                        help="Number of T-step segments; planner solves one open-loop problem over num_cycles*T steps.")
     args = parser.parse_args()
     main(args)
