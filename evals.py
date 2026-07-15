@@ -201,14 +201,18 @@ def _update_line_margin_targets(grid, total_max_margin, total_min_margin):
     return raw_max, raw_min
 
 
+def _margin_overloaded(raw_max, raw_min):
+    """True when any line flow is outside [-limit, limit] at the current init_state."""
+    # Upper overload: flow above +limit (raw_max < 0). Lower overload: flow below -limit (raw_min > 0).
+    return bool(((raw_max < 0) | (raw_min > 0)).any())
+
+
 def _margin_headroom_needs_reset(raw_max, raw_min, limits):
     """True when any line is overloaded or t=0 headroom is too tight for rescaling."""
     threshold = HEADROOM_RESET_FRAC * limits
-    # Upper overload: flow above +limit (raw_max < 0). Lower overload: flow below -limit (raw_min > 0).
     # Nominal flows have raw_max > 0 and raw_min < 0.
-    overloaded = (raw_max < 0) | (raw_min > 0)
     tight = (raw_max < threshold) | (raw_min > -threshold)
-    return bool(overloaded.any() or tight.any())
+    return _margin_overloaded(raw_max, raw_min) or bool(tight.any())
 
 
 def _reset_t0_margin_split(controller_dqp_list, total_max_margin, total_min_margin):
@@ -224,62 +228,84 @@ def _reset_t0_margin_split(controller_dqp_list, total_max_margin, total_min_marg
             controller.line_min_change.data[0].copy_(split_min)
 
 
-def _reproject_line_margins(grid, controller_dqp_list, total_max_margin, total_min_margin, *, repair_boundary=False):
+def _reproject_line_margins(grid, controller_dqp_list, total_max_margin, total_min_margin, *,
+                            repair_boundary=False, auto_repair_overloaded=False):
     """Refresh margin targets from init_state and project split line limits across agents.
 
-    When repair_boundary is True (cycle handoff / cycle>0 start), drop stale future
-    margin schedules and re-split t=0 margins from current headroom.
+    By default, learned per-agent schedules are kept and only corrected so their sums match
+    the new headroom (used on cycle handoff so margins carry across cycles).
+
+    When repair_boundary is True, drop future increments and re-split t=0 equally from current
+    headroom. When auto_repair_overloaded is True, the same reset runs only if any line is
+    overloaded at init_state — plant flows/state are never mutated.
     """
     raw_max, raw_min = _update_line_margin_targets(grid, total_max_margin, total_min_margin)
+    overloaded = _margin_overloaded(raw_max, raw_min)
+    do_repair = repair_boundary or (auto_repair_overloaded and overloaded)
     with torch.no_grad():
-        if repair_boundary:
+        if do_repair:
+            if auto_repair_overloaded and overloaded and not repair_boundary:
+                n_ol = int(((raw_max < 0) | (raw_min > 0)).sum())
+                print(
+                    f"Cycle-start margin repair: {n_ol} overloaded line(s); "
+                    f"re-splitting t=0 headroom (plant state unchanged)",
+                    flush=True)
             for controller in controller_dqp_list:
                 controller.line_max_change.data[1:].zero_()
                 controller.line_min_change.data[1:].zero_()
             _reset_t0_margin_split(controller_dqp_list, total_max_margin, total_min_margin)
     _project_params(controller_dqp_list, max_target_sum=total_max_margin, min_target_sum=total_min_margin)
+    return raw_max, raw_min
 
 
-def _disturbance_horizon(disturbances, global_t, H):
-    """Return H disturbance rows starting at global_t, wrapping if needed."""
+def _disturbance_horizon(disturbances, global_t, H, *, wrap=True):
+    """Return H disturbance rows starting at global_t.
+
+    When ``wrap`` is False, raises if the horizon extends past the end of ``disturbances``.
+    """
     n = disturbances.shape[0]
-    idx = (global_t + torch.arange(H, device=disturbances.device, dtype=torch.long)) % n
+    idx = global_t + torch.arange(H, device=disturbances.device, dtype=torch.long)
+    if wrap:
+        idx = idx % n
+    elif int(idx[-1]) >= n:
+        raise ValueError(
+            f"disturbance horizon global_t={global_t}, H={H} exceeds trajectory length {n}")
     return disturbances[idx]
 
 
-def _normalize_period(period):
-    """Return a non-empty list of per-cycle disturbance multipliers.
+def multi_cycle_noise_length(num_cycles, T, H):
+    """Total pre-generated noise rows for ``num_cycles`` overlapping T-step segments."""
+    return num_cycles * T + H
 
-    Values may be negative (flip disturbance sign), zero (off), or positive (full).
+
+def cycle_noise_window(full_disturbances, cycle, T, H):
+    """Return the (T+H)-row noise segment for training cycle ``cycle`` (0-based).
+
+    Cycle 0 uses rows [0, T+H); cycle 1 uses [T, 2T+H); etc., overlapping by H steps.
     """
-    if period is None:
-        return [1.0]
-    if isinstance(period, (int, float)):
-        return [float(period)]
-    normalized = [float(x) for x in period]
-    if not normalized:
-        raise ValueError("period must be a non-empty list of disturbance multipliers")
-    return normalized
+    start = cycle * T
+    end = start + T + H
+    n = full_disturbances.shape[0]
+    if end > n:
+        raise ValueError(
+            f"cycle {cycle} needs noise rows [{start}, {end}) but trajectory has length {n}; "
+            f"regenerate data with length >= {end} (e.g. multi_cycle_noise_length(num_cycles, T, H))")
+    return full_disturbances[start:end]
 
 
-def _cycle_disturbance_multiplier(cycle, period):
-    """Return the disturbance multiplier for the given cycle (wraps at len(period))."""
-    period = _normalize_period(period)
-    return period[cycle % len(period)]
+def _validate_disturbance_trajectories(all_traj, num_cycles, T, H, *, label="disturbance"):
+    """Ensure stored trajectories are long enough for multi-cycle overlapping windows."""
+    required = multi_cycle_noise_length(num_cycles, T, H)
+    if all_traj.shape[1] < required:
+        raise ValueError(
+            f"{label} trajectories have length {all_traj.shape[1]} but "
+            f"{num_cycles} cycles with T={T}, H={H} require {required} rows "
+            f"(regenerate with: python data/scenario_generation/regenerate_multicycle_trajs.py)")
 
 
-def _disturbances_active(disturbance_multiplier):
-    """True when the cycle applies nonzero disturbances (any sign)."""
-    return disturbance_multiplier != 0
-
-
-def _noise_horizon(train_disturbances, global_t, H, disturbance_multiplier=1.0):
-    """Return H-step noise horizon scaled by the cycle disturbance multiplier.
-
-    Multiplier 0 zeros noise; negative values flip the sign of the forecast.
-    """
-    horizon = _disturbance_horizon(train_disturbances, global_t, H)
-    return horizon * disturbance_multiplier
+def _noise_horizon(disturbances, global_t, H, *, wrap=False):
+    """Return H-step noise forecast from ``disturbances`` (no scaling)."""
+    return _disturbance_horizon(disturbances, global_t, H, wrap=wrap)
 
 
 def _reanchor_curt_to_nominal(grid):
@@ -296,19 +322,6 @@ def _reanchor_curt_to_nominal(grid):
         grid.init_state[grid.state_curt_idx] = nominal_curt.clone()
 
 
-def _should_reanchor_curt_after_disturbance_off(cycle, period):
-    """True when disturbances turn on (any nonzero sign) after an off cycle.
-
-    Covers period patterns like [1,0] and [1,0,-1,0] where cycle 3 uses mult=-1.
-    """
-    if cycle == 0:
-        return False
-    period = _normalize_period(period)
-    curr = period[cycle % len(period)]
-    prev = period[(cycle - 1) % len(period)]
-    return prev == 0 and curr != 0
-
-
 def _begin_traj_rollout(grid, controller_dqp_list, *, reset_grid=True, resync_line_state_each_step=False):
     """Initialize or continue a rollout from the current (or reset) grid state."""
     if reset_grid:
@@ -321,28 +334,49 @@ def _begin_traj_rollout(grid, controller_dqp_list, *, reset_grid=True, resync_li
             controller.update_bus_state()
 
 
-def _rollout_terminal_state(grid, controller_dqp_list, train_disturbances, T, H, dQPTH_layer, *, disturbance_multiplier=1.0, resync_line_state_each_step=True):
-    """Roll out one T-step segment and return the terminal grid state (no grad)."""
+def _rollout_terminal_handoff(grid, controller_dqp_list, train_disturbances, T, H, dQPTH_layer, *, resync_line_state_each_step=True, cycle=0):
+    """Roll out one T-step segment; return terminal state and matching delay buffers (no grad)."""
+    cycle_disturbances = cycle_noise_window(train_disturbances, cycle, T, H)
     with torch.no_grad():
         _begin_traj_rollout(grid, controller_dqp_list, reset_grid=True, resync_line_state_each_step=resync_line_state_each_step)
         for t in range(T):
             if resync_line_state_each_step:
                 _sync_mpc_from_grid(grid, controller_dqp_list)
-            noise = _noise_horizon(train_disturbances, t, H, disturbance_multiplier)
+            noise = _noise_horizon(cycle_disturbances, t, H)
             pred_actions_curt, pred_actions_batt, _, _, _, _ = \
                 controller_utils.get_next_action(grid, controller_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
             grid.update_state(pred_actions_curt[0], pred_actions_batt[0], noise[0])
-        return grid.state.detach().clone()
+        return grid.state.detach().clone(), grid.snapshot_action_buffers()
 
 
-def _prepare_cycle_handoff_state(grid, terminal_state, cycle_start_state=None):
-    """Set init_state to the terminal rollout state without altering line flows."""
-    grid.init_state = terminal_state.detach().clone()
+def _prepare_cycle_handoff_state(grid, terminal_state, action_buffers=None, cycle_start_state=None):
+    """Seed the next cycle from a terminal plant state and its delay-action buffers."""
+    grid.set_cycle_handoff(terminal_state, action_buffers)
     return grid.init_state
+
+
+def _aggregate_line_limit_schedule(source_controller_list, schedule_len):
+    """Sum per-agent margin schedules into one centralized schedule.
+
+    Split controllers store per-step margin *increments*; cumulative sums across
+    agents give the total line headroom the centralized planner should enforce.
+    """
+    if source_controller_list is None:
+        return None, None
+    line_max = torch.stack([c.line_max_change.data for c in source_controller_list]).sum(dim=0)
+    line_min = torch.stack([c.line_min_change.data for c in source_controller_list]).sum(dim=0)
+    n = line_max.shape[0]
+    if n >= schedule_len:
+        return line_max[:schedule_len].clone(), line_min[:schedule_len].clone()
+    pad = schedule_len - n
+    zeros = torch.zeros(pad, line_max.shape[1], dtype=line_max.dtype, device=line_max.device)
+    return torch.cat([line_max, zeros], dim=0), torch.cat([line_min, zeros], dim=0)
+
 
 # @profile
 def get_central_full_traj(grid, T, H, disturbances, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
-                          line_terminal_cost=0.0, batt_curt_terminal_cost=0.0, num_cycles=1):
+                          line_terminal_cost=0.0, batt_curt_terminal_cost=0.0, num_cycles=1, soft_bus_constraints=True,
+                          source_controller_list=None):
     """
     Simulates what a fully centralized planner would do with full knowledge of future disturbances.
 
@@ -361,6 +395,9 @@ def get_central_full_traj(grid, T, H, disturbances, batt_cost, curt_change_cost,
             load drifts (wraps if the plan needs rows past the end)
         num_cycles (int):
             number of consecutive T-step segments in the plan
+        source_controller_list (list of Split_Constraint_Controller, optional):
+            When provided, sum these agents' learned ``line_max/min_change`` schedules
+            and apply them to the single centralized controller (instead of default margins).
     Returns:
         ckpt (dict): Contains run results, keys are:
             actions_curt (Torch tensor of shape (num_cycles * T, grid.num_curt))
@@ -377,13 +414,17 @@ def get_central_full_traj(grid, T, H, disturbances, batt_cost, curt_change_cost,
     dist = disturbances[0] if disturbances.dim() == 3 else disturbances
     total_steps = num_cycles * T
     plan_horizon = total_steps
+    if dist.shape[0] < total_steps:
+        raise ValueError(
+            f"disturbance trajectory has length {dist.shape[0]} but open-loop rollout needs "
+            f"{total_steps} rows (num_cycles={num_cycles}, T={T})")
 
     partition = [[i for i in range(grid.num_buses)]]
     num_agents = 1
     controller_dqp_list = controller_utils.create_split_constraint_controllers(
         grid, num_agents, partition, plan_horizon, plan_horizon, batt_cost, curt_change_cost,
         curt_net_cost, bus_slack_cost, line_slack_cost, line_terminal_cost=line_terminal_cost,
-        batt_curt_terminal_cost=batt_curt_terminal_cost)
+        batt_curt_terminal_cost=batt_curt_terminal_cost, soft_bus_constraints=soft_bus_constraints)
     pool = mp.Pool(processes=num_agents)
     settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
@@ -392,10 +433,17 @@ def get_central_full_traj(grid, T, H, disturbances, batt_cost, curt_change_cost,
     for controller in controller_dqp_list:
         controller.zero_line_state()
         controller.update_bus_state()
-        controller.reset_params()
+    schedule_len = 2 * plan_horizon
+    agg_max, agg_min = _aggregate_line_limit_schedule(source_controller_list, schedule_len)
+    if agg_max is not None:
+        controller_utils.assign_line_limit_changes(
+            controller_dqp_list, agg_max.unsqueeze(0), agg_min.unsqueeze(0))
+    else:
+        for controller in controller_dqp_list:
+            controller.reset_params()
     _sync_cycle_start_references(grid, controller_dqp_list)
 
-    noise = _disturbance_horizon(dist, 0, total_steps)
+    noise = _disturbance_horizon(dist, 0, total_steps, wrap=False)
     print(f"solving {total_steps}-step plan ({num_cycles} cycles × {T} steps)")
     start_time = time.time()
     actions_curt, actions_batt, _, _, _, _ = \
@@ -459,18 +507,25 @@ def get_central_full_traj(grid, T, H, disturbances, batt_cost, curt_change_cost,
     }
 
     pool.close()
+    pool.join()
 
     return ckpt
 
 
-def evaluate_base_on_traj(grid, base_controller_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost):
+def evaluate_base_on_traj(grid, base_controller_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost, *, cycle=0):
     """
     Gets cost associated with running base MPCs on a test trajectory.
+
+    ``cycle`` selects the overlapping noise window within a multi-cycle trajectory
+    (same convention as ``evaluate_on_traj`` / ``run_dec`` single-cycle uses cycle=0).
     """
+    cycle_disturbances = cycle_noise_window(test_traj, cycle, T, H)
     grid.reset_state()
     for controller in base_controller_list:
         controller.update_line_state()
         controller.update_bus_state()
+    # Drop any warm-start bases from split-constraint QPs (different z_dim / nConstr).
+    dQPTH_layer.clear_cache()
     actions_curt = torch.zeros(T, grid.num_curt)
     actions_batt = torch.zeros(T, grid.num_batt)
     viol_per_step = torch.zeros(T)
@@ -485,7 +540,7 @@ def evaluate_base_on_traj(grid, base_controller_list, dQPTH_layer, test_traj, T,
         for controller in base_controller_list:
             controller.update_line_state()
             controller.update_bus_state()
-        noise = test_traj[t:t+H,:]
+        noise = _noise_horizon(cycle_disturbances, t, H)
         pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks = \
             controller_utils.get_next_action_base(grid, base_controller_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
 
@@ -538,12 +593,13 @@ def evaluate_base_on_traj(grid, base_controller_list, dQPTH_layer, test_traj, T,
     return ckpt
 
 # @profile
-def evaluate_on_traj(grid, controller_dqp_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost, *, disturbance_multiplier=1.0):
+def evaluate_on_traj(grid, controller_dqp_list, dQPTH_layer, test_traj, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost, *, cycle=0):
     """
     Gets cost associated with running MPC with configured limits on a test trajectory.
 
-    disturbance_multiplier scales/flips the forecast (0=off, 1=full, -1=opposite sign).
+    cycle selects the overlapping noise window within a multi-cycle trajectory.
     """
+    cycle_disturbances = cycle_noise_window(test_traj, cycle, T, H)
     grid.reset_state()
     for controller in controller_dqp_list:
         controller.zero_line_state()
@@ -554,7 +610,8 @@ def evaluate_on_traj(grid, controller_dqp_list, dQPTH_layer, test_traj, T, H, ba
     _reproject_line_margins(grid, controller_dqp_list, total_max_margin, total_min_margin)
 
     test_total_loss = torch.zeros(3)
-    dQPTH_layer.reset_cache()
+    # Drop any warm-start bases from base-MPC QPs (different z_dim / nConstr).
+    dQPTH_layer.clear_cache()
 
     actions_curt = torch.zeros(T, grid.num_curt)
     actions_batt = torch.zeros(T, grid.num_batt)
@@ -567,7 +624,7 @@ def evaluate_on_traj(grid, controller_dqp_list, dQPTH_layer, test_traj, T, H, ba
     total_train_loss = 0
 
     for t in range(T):
-        noise = _noise_horizon(test_traj, t, H, disturbance_multiplier)
+        noise = _noise_horizon(cycle_disturbances, t, H)
         pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks, _ = \
             controller_utils.get_next_action(grid, controller_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
 
@@ -644,7 +701,8 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
     # MPC rollout uses T+H
     controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, H, T, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost, line_terminal_cost=line_terminal_cost,
-                                                            batt_curt_terminal_cost=batt_curt_terminal_cost)
+                                                            batt_curt_terminal_cost=batt_curt_terminal_cost,
+                                                            soft_bus_constraints=True)
     pool = mp.Pool(processes=num_agents)
     settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
@@ -827,93 +885,252 @@ def train_with_surrogate(grid, T, H, all_train_traj, batt_cost, curt_change_cost
     return ckpt
 
 
-def _reset_grid_for_cycle_test(grid, controller_dqp_list, total_max_margin, total_min_margin,
-                               cycle_start_state, cycle_start_target_batt_charges):
-    """Reset to this cycle's start state, keep learned line limits, and refresh MPC references."""
-    grid.init_state = cycle_start_state.detach().clone()
+def _assert_soft_bus_controllers(controller_list, *, label):
+    """Fail fast if any controller lacks soft bus slacks (needed for multi-cycle feasibility)."""
+    bad = [
+        i for i, c in enumerate(controller_list)
+        if not getattr(c, "soft_bus_constraints", False)
+        or getattr(c, "bus_slack_start_idx", None) is None
+    ]
+    if bad:
+        raise RuntimeError(
+            f"{label}: controllers {bad} are missing soft bus constraints "
+            f"(soft_bus_constraints / bus_slack_start_idx required for cycle feasibility)")
+
+
+def _restore_cycle_start(grid, cycle_start_state, cycle_start_target_batt_charges,
+                         cycle_start_action_buffers=None):
+    """Restore plant init_state and matching delay buffers (physics-consistent handoff)."""
     grid.target_batt_charges = cycle_start_target_batt_charges.detach().clone()
+    if cycle_start_action_buffers is not None:
+        grid.set_cycle_handoff(cycle_start_state, cycle_start_action_buffers)
+    else:
+        grid.init_state = cycle_start_state.detach().clone()
     grid.reset_state()
+
+
+def _reset_grid_for_cycle_test(grid, controller_dqp_list, total_max_margin, total_min_margin,
+                               cycle_start_state, cycle_start_target_batt_charges,
+                               cycle_start_action_buffers=None):
+    """Reset to this cycle's start state, keep learned line limits, and refresh MPC references."""
+    _restore_cycle_start(
+        grid, cycle_start_state, cycle_start_target_batt_charges, cycle_start_action_buffers)
     for controller in controller_dqp_list:
         controller.zero_line_state()
         controller.update_bus_state()
     _sync_cycle_start_references(grid, controller_dqp_list)
+    # Keep learned margins; only re-anchor totals to this cycle-start headroom.
+    _reproject_line_margins(grid, controller_dqp_list, total_max_margin, total_min_margin)
+
+
+def _reset_grid_for_base_cycle_test(grid, base_controller_list, cycle_start_state,
+                                    cycle_start_target_batt_charges,
+                                    cycle_start_action_buffers=None):
+    """Reset to this cycle's start state for the run_dec base-MPC baseline."""
+    _restore_cycle_start(
+        grid, cycle_start_state, cycle_start_target_batt_charges, cycle_start_action_buffers)
+    for controller in base_controller_list:
+        controller.update_line_state()
+        controller.update_bus_state()
+    _sync_cycle_start_references(grid, base_controller_list)
+
+
+def _ensure_cycle_start_feasible(grid, controller_dqp_list, total_max_margin, total_min_margin,
+                                 cycle_start_state, cycle_start_target_batt_charges,
+                                 cycle_start_action_buffers, dQPTH_layer, H, *, cycle=0):
+    """Prepare a cycle-start operating point whose soft-bus MPC model is solvable.
+
+    Leaves the physical plant state and delay buffers untouched; only margin parameters and
+    QP warm-start caches may change. Logs plant-box feasibility for diagnostics.
+    """
+    _restore_cycle_start(
+        grid, cycle_start_state, cycle_start_target_batt_charges, cycle_start_action_buffers)
+    for controller in controller_dqp_list:
+        controller.zero_line_state()
+        controller.update_bus_state()
+    _sync_cycle_start_references(grid, controller_dqp_list)
+    # Prefer carrying learned margins; only wipe t=0/future increments if headroom is
+    # overloaded or the cold probe below fails.
     _reproject_line_margins(
-        grid, controller_dqp_list, total_max_margin, total_min_margin, repair_boundary=True)
+        grid, controller_dqp_list, total_max_margin, total_min_margin,
+        auto_repair_overloaded=True)
+    dQPTH_layer.clear_cache()
+
+    feasible, infeas_idx, violations = grid.check_state_feasible()
+    if not feasible:
+        print(
+            f"Cycle {cycle + 1} start plant has {len(infeas_idx)} box-constraint violation(s) "
+            f"(max={float(violations.max()) if len(violations) else 0:.4g}); "
+            f"keeping physical state and relying on soft bus/line slacks",
+            flush=True)
+
+    # Cold probe: one MPC solve from this start with zero forecast noise.
+    noise = torch.zeros(H, grid.num_buses)
+    try:
+        controller_utils.get_next_action(
+            grid, controller_dqp_list, noise, 0, dQPTH_layer, verbose=False, update_state=False)
+    except Exception as e:
+        print(
+            f"Cycle {cycle + 1} start MPC probe failed ({e}); "
+            f"forcing equal t=0 margin split and retrying",
+            flush=True)
+        _reproject_line_margins(
+            grid, controller_dqp_list, total_max_margin, total_min_margin,
+            repair_boundary=True)
+        dQPTH_layer.clear_cache()
+        controller_utils.get_next_action(
+            grid, controller_dqp_list, noise, 0, dQPTH_layer, verbose=False, update_state=False)
+    finally:
+        # Probe must not leave the plant advanced / buffers mutated when update_state=False,
+        # but re-seed from the cycle snapshot for safety.
+        _restore_cycle_start(
+            grid, cycle_start_state, cycle_start_target_batt_charges, cycle_start_action_buffers)
+        for controller in controller_dqp_list:
+            controller.zero_line_state()
+            controller.update_bus_state()
+        _sync_cycle_start_references(grid, controller_dqp_list)
+        dQPTH_layer.clear_cache()
 
 
 def _run_cycle_tests(grid, controller_dqp_list, dQPTH_layer, cycle_test_trajs, T, H,
-                     disturbance_multiplier, batt_cost, curt_change_cost, curt_net_cost,
+                     batt_cost, curt_change_cost, curt_net_cost,
                      bus_slack_cost, line_slack_cost, total_max_margin, total_min_margin,
                      cycle_start_state, cycle_start_target_batt_charges, *,
-                     compare_optimal=True, line_terminal_cost=0.0, batt_curt_terminal_cost=0.0):
-    """Evaluate learned decentralized MPC vs centralized planner from this cycle's start state.
+                     cycle_start_action_buffers=None,
+                     compare_optimal=True, compare_dec=False, base_controller_list=None,
+                     line_terminal_cost=0.0, batt_curt_terminal_cost=0.0,
+                     cycle=0):
+    """Evaluate learned split-constraint MPC from this cycle's start state.
+
+    Optionally compares against:
+      - centralized open-loop planner (``compare_optimal``)
+      - fixed base decentralized MPC from ``run_dec`` (``compare_dec``)
 
     Each trajectory is rolled out from ``cycle_start_state`` (not the construction baseline)
-    with the current learned line limits. Returns per-trajectory losses and the terminal grid
-    state from the last decentralized test rollout (used as the next cycle's starting point).
+    with the current learned line limits. Returns per-trajectory losses plus the terminal grid
+    state and delay-action buffers from the last learned test rollout (next-cycle handoff).
     """
+    if compare_dec and base_controller_list is None:
+        raise ValueError("compare_dec=True requires base_controller_list")
+
     num_traj = cycle_test_trajs.shape[0]
     our_losses = torch.zeros(num_traj, 3)
     optimal_losses = torch.zeros(num_traj, 3) if compare_optimal else None
+    dec_losses = torch.zeros(num_traj, 3) if compare_dec else None
     handoff_terminal_state = None
+    handoff_action_buffers = None
 
     with torch.no_grad():
         for j in range(num_traj):
-            _reset_grid_for_cycle_test(
-                grid, controller_dqp_list, total_max_margin, total_min_margin,
-                cycle_start_state, cycle_start_target_batt_charges)
-            dQPTH_layer.clear_cache()
             test_traj = cycle_test_trajs[j]
-            ckpt_ours = evaluate_on_traj(
-                grid, controller_dqp_list, dQPTH_layer, test_traj, T, H,
-                batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
-                disturbance_multiplier=disturbance_multiplier)
-            our_losses[j] = ckpt_ours["total_losses"]
-            handoff_terminal_state = grid.state.detach().clone()
-
-            if compare_optimal:
+            try:
                 _reset_grid_for_cycle_test(
                     grid, controller_dqp_list, total_max_margin, total_min_margin,
-                    cycle_start_state, cycle_start_target_batt_charges)
-                scaled_disturbances = test_traj * disturbance_multiplier
-                ckpt_central = get_central_full_traj(
-                    grid, T, H, scaled_disturbances, batt_cost, curt_change_cost, curt_net_cost,
-                    bus_slack_cost, line_slack_cost,
-                    line_terminal_cost=line_terminal_cost, batt_curt_terminal_cost=batt_curt_terminal_cost,
-                    num_cycles=1)
-                optimal_losses[j] = ckpt_central["total_losses"]
+                    cycle_start_state, cycle_start_target_batt_charges,
+                    cycle_start_action_buffers)
+                dQPTH_layer.clear_cache()
+                ckpt_ours = evaluate_on_traj(
+                    grid, controller_dqp_list, dQPTH_layer, test_traj, T, H,
+                    batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
+                    cycle=cycle)
+                our_losses[j] = ckpt_ours["total_losses"]
+                # Capture before dec/optimal comparisons mutate the grid / clear delay buffers.
+                handoff_terminal_state = grid.state.detach().clone()
+                handoff_action_buffers = grid.snapshot_action_buffers()
+            except Exception as e:
+                print(
+                    f"Cycle {cycle + 1} ours test traj {j} failed: {e}",
+                    flush=True)
+                our_losses[j] = -1
+                dQPTH_layer.clear_cache()
 
-    our_total = float(our_losses[:, 0].sum())
-    our_econ = float(our_losses[:, 1].sum())
-    our_viol = float(our_losses[:, 2].sum())
+            if compare_dec:
+                try:
+                    _reset_grid_for_base_cycle_test(
+                        grid, base_controller_list,
+                        cycle_start_state, cycle_start_target_batt_charges,
+                        cycle_start_action_buffers)
+                    dQPTH_layer.clear_cache()
+                    ckpt_dec = evaluate_base_on_traj(
+                        grid, base_controller_list, dQPTH_layer, test_traj, T, H,
+                        batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
+                        cycle=cycle)
+                    dec_losses[j] = ckpt_dec["total_losses"]
+                except Exception as e:
+                    print(
+                        f"Cycle {cycle + 1} dec (base) test traj {j} failed: {e}",
+                        flush=True)
+                    dec_losses[j] = -1
+                    dQPTH_layer.clear_cache()
+
+            if compare_optimal:
+                try:
+                    _reset_grid_for_cycle_test(
+                        grid, controller_dqp_list, total_max_margin, total_min_margin,
+                        cycle_start_state, cycle_start_target_batt_charges,
+                        cycle_start_action_buffers)
+                    cycle_disturbances = cycle_noise_window(test_traj, cycle, T, H)
+                    # Preserve cycle-start seed across the central planner (it rolls the plant).
+                    saved_init = grid.init_state.detach().clone()
+                    saved_buffers = grid.init_action_buffers
+                    ckpt_central = get_central_full_traj(
+                        grid, T, H, cycle_disturbances, batt_cost, curt_change_cost, curt_net_cost,
+                        bus_slack_cost, line_slack_cost,
+                        line_terminal_cost=line_terminal_cost, batt_curt_terminal_cost=batt_curt_terminal_cost,
+                        num_cycles=1, soft_bus_constraints=True,
+                        source_controller_list=controller_dqp_list)
+                    optimal_losses[j] = ckpt_central["total_losses"]
+                    grid.init_state = saved_init
+                    grid.init_action_buffers = saved_buffers
+                    grid.reset_state()
+                except Exception as e:
+                    print(
+                        f"Cycle {cycle + 1} optimal test traj {j} failed: {e}",
+                        flush=True)
+                    optimal_losses[j] = -1
+                    dQPTH_layer.clear_cache()
+
+    def _sum_valid(losses):
+        ok = losses[:, 0] >= 0
+        if not bool(ok.any()):
+            return float("nan"), float("nan"), float("nan")
+        tot = losses[ok].sum(dim=0)
+        return float(tot[0]), float(tot[1]), float(tot[2])
+
+    our_total, our_econ, our_viol = _sum_valid(our_losses)
     result = {
-        "disturbance_multiplier": disturbance_multiplier,
         "our_losses_per_traj": our_losses,
         "our_total": our_total,
         "our_econ": our_econ,
         "our_viol": our_viol,
     }
+    if compare_dec:
+        dec_total, dec_econ, dec_viol = _sum_valid(dec_losses)
+        result.update({
+            "dec_losses_per_traj": dec_losses,
+            "dec_total": dec_total,
+            "dec_econ": dec_econ,
+            "dec_viol": dec_viol,
+            "dec_gap": our_total - dec_total if our_total == our_total and dec_total == dec_total else float("nan"),
+            "dec_ratio": (our_total / dec_total) if (dec_total == dec_total and dec_total != 0) else float("nan"),
+        })
     if compare_optimal:
-        opt_total = float(optimal_losses[:, 0].sum())
-        opt_econ = float(optimal_losses[:, 1].sum())
-        opt_viol = float(optimal_losses[:, 2].sum())
+        opt_total, opt_econ, opt_viol = _sum_valid(optimal_losses)
         result.update({
             "optimal_losses_per_traj": optimal_losses,
             "optimal_total": opt_total,
             "optimal_econ": opt_econ,
             "optimal_viol": opt_viol,
-            "gap": our_total - opt_total,
-            "ratio": our_total / opt_total if opt_total != 0 else float("nan"),
+            "gap": our_total - opt_total if our_total == our_total and opt_total == opt_total else float("nan"),
+            "ratio": (our_total / opt_total) if (opt_total == opt_total and opt_total != 0) else float("nan"),
         })
-    return handoff_terminal_state, result
+    return handoff_terminal_state, handoff_action_buffers, result
 
 
-def _optimal_cycle_comparison(grid, T, H, all_train_traj, disturbance_multiplier,
-                              batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
-                              line_terminal_cost=0.0, batt_curt_terminal_cost=0.0):
-    """Run the centralized planner (the algorithm in experiments/2b_get_test_traj_opt.py) for a
-    single T-step cycle on every training trajectory, with the cycle's disturbance multiplier
-    applied to the load drifts.
+def _optimal_cycle_comparison(grid, T, H, all_train_traj, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
+                              line_terminal_cost=0.0, batt_curt_terminal_cost=0.0, *,
+                              controller_dqp_list=None, cycle=0):
+    """Run the centralized planner for a single T-step cycle on every training trajectory.
 
     Each solve starts from the current ``grid.init_state`` (the cycle-start state), so the
     comparison uses the same initial operating point as the just-trained decentralized cycle.
@@ -924,6 +1141,10 @@ def _optimal_cycle_comparison(grid, T, H, all_train_traj, disturbance_multiplier
     saved_init_state = grid.init_state.clone()
     saved_state = grid.state.clone()
     saved_targets = grid.target_batt_charges.clone()
+    saved_action_buffers = (
+        grid.snapshot_action_buffers() if grid.init_action_buffers is not None else None
+    )
+    saved_init_action_buffers = grid.init_action_buffers
 
     num_traj = all_train_traj.shape[0]
     optimal_losses = torch.zeros(num_traj, 3)
@@ -931,49 +1152,43 @@ def _optimal_cycle_comparison(grid, T, H, all_train_traj, disturbance_multiplier
         # Restore the cycle-start init so every centralized solve sees the same starting point.
         grid.init_state = saved_init_state.clone()
         grid.target_batt_charges = saved_targets.clone()
-        scaled_disturbances = all_train_traj[traj] * disturbance_multiplier
+        grid.init_action_buffers = saved_init_action_buffers
+        cycle_disturbances = cycle_noise_window(all_train_traj[traj], cycle, T, H)
         ckpt_central = get_central_full_traj(
-            grid, T, H, scaled_disturbances, batt_cost, curt_change_cost, curt_net_cost,
+            grid, T, H, cycle_disturbances, batt_cost, curt_change_cost, curt_net_cost,
             bus_slack_cost, line_slack_cost,
             line_terminal_cost=line_terminal_cost, batt_curt_terminal_cost=batt_curt_terminal_cost,
-            num_cycles=1)
+            num_cycles=1, soft_bus_constraints=True,
+            source_controller_list=controller_dqp_list)
         optimal_losses[traj] = ckpt_central["total_losses"]
 
     grid.init_state = saved_init_state
     grid.state = saved_state
     grid.target_batt_charges = saved_targets
+    grid.init_action_buffers = saved_init_action_buffers
+    grid.restore_action_buffers(saved_action_buffers)
     return optimal_losses
 
 
 def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost, epochs, lr,
                       optimizer_type='clipped_gd', max_grad_norm=30, lr_schedule=None, schedule_kwargs=None, batch_size=None,
-                      line_terminal_cost=0.0, batt_curt_terminal_cost=0.0, num_cycles=1, period=None,
-                      compare_optimal_on_negative=False, zero_noise_epochs=None,
-                      cycle_test_trajs=None, compare_optimal_each_cycle=True):
+                      line_terminal_cost=0.0, batt_curt_terminal_cost=0.0, num_cycles=1,
+                      cycle_test_trajs=None, compare_optimal_each_cycle=True, compare_dec_each_cycle=True):
     """
         Learns line impact allocations over multiple scenarios.
 
         Each cycle:
-        1. Train for ``epochs`` (or ``zero_noise_epochs`` on off cycles) on T-step rollouts.
-        2. Reset the grid to this cycle's start state while keeping learned line limits.
-        3. Roll out on ``cycle_test_trajs`` (if provided) and compare to the centralized planner
-           from experiments/2b_get_test_traj_opt.py when ``compare_optimal_each_cycle`` is True.
-        4. Seed the next cycle from the terminal state of the last decentralized test rollout.
-
-        ``period`` lists per-cycle disturbance multipliers (wraps at end). Use 0 for
-        off, 1 for full forecast, -1 for opposite sign (e.g. [1, 0, -1, 0]).
-
-        ``zero_noise_epochs`` (optional): number of epochs to run on zero-multiplier
-        (no-disturbance) cycles instead of ``epochs``. These cycles barely change the
-        learned line margins (flows never approach limits without a disturbance), so a
-        small value saves compute. ``None`` uses ``epochs`` for every cycle.
-
-        ``compare_optimal_on_negative`` is deprecated; use ``compare_optimal_each_cycle`` instead.
+        1. Train for ``epochs`` on T-step rollouts.
+        2. Reset the grid to this cycle's start state while keeping learned line limits
+           (totals are reprojected to the current headroom; the per-agent schedule is carried).
+        3. Roll out on ``cycle_test_trajs`` (if provided) and optionally compare to the
+           centralized planner and/or the fixed base decentralized MPC (``run_dec``).
+        4. Seed the next cycle from the terminal state (+ delay-action buffers) of the last
+           learned test rollout, carrying learned margins forward (reprojected to the
+           handoff headroom).
     """
     if num_cycles < 1:
         raise ValueError(f"num_cycles must be >= 1, got {num_cycles}")
-
-    period = _normalize_period(period)
 
     T_horizon = T
     num_agents = 3
@@ -981,7 +1196,23 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
 
     controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, T_horizon, H, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost, line_terminal_cost=line_terminal_cost,
-                                                            batt_curt_terminal_cost=batt_curt_terminal_cost)
+                                                            batt_curt_terminal_cost=batt_curt_terminal_cost,
+                                                            soft_bus_constraints=True)
+    _assert_soft_bus_controllers(controller_dqp_list, label="learned split MPC")
+    # Soft-bus base for every cycle so delayed/congested starts stay QP-feasible while
+    # leaving plant handoff state unchanged (same cost weights; bus limits as penalties).
+    base_controller_list = None
+    if compare_dec_each_cycle:
+        base_controller_list = controller_utils.create_base_controllers(
+            grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
+            curt_net_cost, bus_slack_cost, line_slack_cost,
+            soft_bus_constraints=True)
+        for controller in base_controller_list:
+            controller.init_matrices()
+        _assert_soft_bus_controllers(base_controller_list, label="base (dec) MPC")
+        print(
+            "Base (dec) MPC uses soft bus constraints on every cycle",
+            flush=True)
     pool = mp.Pool(processes=num_agents)
     settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
@@ -997,23 +1228,23 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
     run_failed = False
     fail_message = ""
 
-    # Zero-multiplier cycles may run fewer epochs; size the loss grids to the widest cycle and
-    # leave unused (cycle, epoch) slots as NaN so plotting skips them instead of drawing fake zeros.
-    max_epochs = epochs if zero_noise_epochs is None else max(epochs, zero_noise_epochs)
-    total_losses = torch.full((num_cycles, max_epochs), float("nan"))
-    total_econ_losses = torch.full((num_cycles, max_epochs), float("nan"))
-    total_viol_losses = torch.full((num_cycles, max_epochs), float("nan"))
-    total_train_losses = torch.full((num_cycles, max_epochs), float("nan"))
-    total_terminal_losses = torch.full((num_cycles, max_epochs), float("nan"))
+    total_losses = torch.full((num_cycles, epochs), float("nan"))
+    total_econ_losses = torch.full((num_cycles, epochs), float("nan"))
+    total_viol_losses = torch.full((num_cycles, epochs), float("nan"))
+    total_train_losses = torch.full((num_cycles, epochs), float("nan"))
+    total_terminal_losses = torch.full((num_cycles, epochs), float("nan"))
     lr_reduction_epochs = []
     optimal_comparison = {}
+    dec_comparison = {}
     cycle_test_results = {}
 
     if cycle_test_trajs is None and num_cycles > 1:
         cycle_test_trajs = all_train_traj
     run_cycle_tests = cycle_test_trajs is not None and num_cycles > 1
-    if compare_optimal_on_negative and not compare_optimal_each_cycle:
-        compare_optimal_each_cycle = True
+
+    _validate_disturbance_trajectories(all_train_traj, num_cycles, T, H, label="training")
+    if cycle_test_trajs is not None:
+        _validate_disturbance_trajectories(cycle_test_trajs, num_cycles, T, H, label="cycle test")
 
     for cycle in range(num_cycles):
         # Each cycle tracks its own LOCALLY-predicted line flows (line_state is seeded to 0 against
@@ -1023,10 +1254,6 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
         # learned margins get applied to flows the agent never predicted and curtailment explodes.
         # tmp_resync_test.py shows this inflates single-cycle curt_net ~42x (1.1e3 -> 4.7e4).
         resync_line_state = False
-        disturbance_multiplier = _cycle_disturbance_multiplier(cycle, period)
-        cycle_epochs = epochs
-        if zero_noise_epochs is not None and not _disturbances_active(disturbance_multiplier):
-            cycle_epochs = zero_noise_epochs
         if cycle == 0:
             grid.reset_state()
             for controller in controller_dqp_list:
@@ -1036,6 +1263,9 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
             _sync_cycle_start_references(grid, controller_dqp_list)
             if resync_line_state:
                 _sync_mpc_from_grid(grid, controller_dqp_list)
+            cycle_start_state = grid.init_state.detach().clone()
+            cycle_start_target_batt_charges = grid.target_batt_charges.detach().clone()
+            cycle_start_action_buffers = None
         else:
             # Start from the terminal state left by the previous cycle's test rollout.
             grid.reset_state()
@@ -1044,26 +1274,35 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
                 controller.update_bus_state()
             _sync_cycle_start_references(grid, controller_dqp_list)
             dQPTH_layer.clear_cache()
-
-        _reproject_line_margins(
+            cycle_start_state = grid.init_state.detach().clone()
+            cycle_start_target_batt_charges = grid.target_batt_charges.detach().clone()
+            cycle_start_action_buffers = (
+                grid.snapshot_action_buffers() if grid.init_action_buffers is not None else None)
+        # Soft-bus MPC feasibility check / margin repair at the start of every cycle.
+        _ensure_cycle_start_feasible(
             grid, controller_dqp_list, total_max_margin, total_min_margin,
-            repair_boundary=(cycle > 0))
-
-        cycle_start_state = grid.init_state.detach().clone()
-        cycle_start_target_batt_charges = grid.target_batt_charges.detach().clone()
+            cycle_start_state, cycle_start_target_batt_charges, cycle_start_action_buffers,
+            dQPTH_layer, H, cycle=cycle)
+        if base_controller_list is not None:
+            _assert_soft_bus_controllers(
+                base_controller_list, label=f"base (dec) MPC at cycle {cycle + 1}")
         print(
-            f"Cycle {cycle + 1}/{num_cycles}: disturbance_multiplier={disturbance_multiplier}",
+            f"Cycle {cycle + 1}/{num_cycles}",
             flush=True)
 
         if cycle == 0:
             param_groups = [{'params': [controller.line_max_change, controller.line_min_change]} for controller in controller_dqp_list]
             optimizer = _make_optimizer(param_groups, optimizer_type, lr)
-        scheduler = _make_scheduler(optimizer, lr_schedule, schedule_kwargs, cycle_epochs * steps_per_epoch)
+        else:
+            # Plateau decays carry across cycles otherwise; restore the configured lr each cycle.
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+        scheduler = _make_scheduler(optimizer, lr_schedule, schedule_kwargs, epochs * steps_per_epoch)
 
         print(
-            f"Starting training cycle {cycle + 1}/{num_cycles} ({cycle_epochs} epochs)",
+            f"Starting training cycle {cycle + 1}/{num_cycles} ({epochs} epochs, lr={lr})",
             flush=True)
-        for epoch in tqdm(range(cycle_epochs), desc=f"cycle {cycle + 1}/{num_cycles}"):
+        for epoch in tqdm(range(epochs), desc=f"cycle {cycle + 1}/{num_cycles}"):
             epoch_total_loss = 0
             epoch_econ_loss = 0
             epoch_viol_loss = 0
@@ -1086,6 +1325,7 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
 
                 for traj in batch_idx:
                     train_disturbances = all_train_traj[traj]
+                    cycle_disturbances = cycle_noise_window(train_disturbances, cycle, T, H)
 
                     total_loss = 0
                     total_econ_loss = 0
@@ -1100,12 +1340,15 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
                     _begin_traj_rollout(
                         grid, controller_dqp_list, reset_grid=True,
                         resync_line_state_each_step=resync_line_state)
+                    # Drop previous-traj bases so t=0 is cold; avoids stale warm-starts across
+                    # handoff / traj noise changes (control_delay amplifies RHS jumps).
+                    dQPTH_layer.clear_cache()
 
                     start_time = time.time()
                     for t in range(T):
                         if resync_line_state:
                             _sync_mpc_from_grid(grid, controller_dqp_list)
-                        noise = _noise_horizon(train_disturbances, t, H, disturbance_multiplier)
+                        noise = _noise_horizon(cycle_disturbances, t, H)
                         pred_actions_curt, pred_actions_batt, pred_line_max_slacks, pred_line_min_slacks, pred_bus_slacks, mpc_terminal_loss = \
                             controller_utils.get_next_action(grid, controller_dqp_list, noise, t, dQPTH_layer, verbose=False, update_state=True)
                         action_curt = pred_actions_curt[0]
@@ -1197,32 +1440,51 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
             total_terminal_losses[cycle, epoch] = epoch_terminal_loss
 
         cycle_test_handoff_state = None
+        cycle_test_handoff_buffers = None
         if run_cycle_tests:
             print(
                 f"Cycle {cycle + 1}/{num_cycles}: resetting to cycle start state with learned limits, "
-                f"running {cycle_test_trajs.shape[0]} test rollouts (dist_mult={disturbance_multiplier})",
+                f"running {cycle_test_trajs.shape[0]} test rollouts",
                 flush=True)
-            do_optimal_compare = compare_optimal_each_cycle or (
-                compare_optimal_on_negative and disturbance_multiplier < 0)
-            cycle_test_handoff_state, cycle_test_result = _run_cycle_tests(
+            cycle_test_handoff_state, cycle_test_handoff_buffers, cycle_test_result = _run_cycle_tests(
                 grid, controller_dqp_list, dQPTH_layer, cycle_test_trajs, T, H,
-                disturbance_multiplier, batt_cost, curt_change_cost, curt_net_cost,
+                batt_cost, curt_change_cost, curt_net_cost,
                 bus_slack_cost, line_slack_cost, total_max_margin, total_min_margin,
                 cycle_start_state, cycle_start_target_batt_charges,
-                compare_optimal=do_optimal_compare,
-                line_terminal_cost=line_terminal_cost, batt_curt_terminal_cost=batt_curt_terminal_cost)
+                cycle_start_action_buffers=cycle_start_action_buffers,
+                compare_optimal=compare_optimal_each_cycle,
+                compare_dec=compare_dec_each_cycle,
+                base_controller_list=base_controller_list,
+                line_terminal_cost=line_terminal_cost, batt_curt_terminal_cost=batt_curt_terminal_cost,
+                cycle=cycle)
             cycle_test_results[cycle] = cycle_test_result
             msg = (
                 f"Cycle {cycle + 1} test: our_total={cycle_test_result['our_total']:.4f} "
                 f"(econ={cycle_test_result['our_econ']:.4f}, viol={cycle_test_result['our_viol']:.4f})"
             )
-            if do_optimal_compare:
+            if compare_dec_each_cycle:
+                msg += (
+                    f" | dec_total={cycle_test_result['dec_total']:.4f} "
+                    f"dec_gap={cycle_test_result['dec_gap']:.4f} "
+                    f"dec_ratio={cycle_test_result['dec_ratio']:.4f}"
+                )
+                dec_comparison[cycle] = {
+                    "learned_total": cycle_test_result["our_total"],
+                    "learned_econ": cycle_test_result["our_econ"],
+                    "learned_viol": cycle_test_result["our_viol"],
+                    "dec_total": cycle_test_result["dec_total"],
+                    "dec_econ": cycle_test_result["dec_econ"],
+                    "dec_viol": cycle_test_result["dec_viol"],
+                    "dec_losses_per_traj": cycle_test_result["dec_losses_per_traj"],
+                    "gap": cycle_test_result["dec_gap"],
+                    "ratio": cycle_test_result["dec_ratio"],
+                }
+            if compare_optimal_each_cycle:
                 msg += (
                     f" | optimal_total={cycle_test_result['optimal_total']:.4f} "
                     f"gap={cycle_test_result['gap']:.4f} ratio={cycle_test_result['ratio']:.4f}"
                 )
                 optimal_comparison[cycle] = {
-                    "disturbance_multiplier": disturbance_multiplier,
                     "learned_total": cycle_test_result["our_total"],
                     "learned_econ": cycle_test_result["our_econ"],
                     "learned_viol": cycle_test_result["our_viol"],
@@ -1239,22 +1501,33 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
 
         if cycle < num_cycles - 1:
             if cycle_test_handoff_state is not None:
-                _prepare_cycle_handoff_state(grid, cycle_test_handoff_state, cycle_start_state)
+                _prepare_cycle_handoff_state(
+                    grid, cycle_test_handoff_state, cycle_test_handoff_buffers, cycle_start_state)
                 handoff_source = "test rollout terminal state"
             else:
-                terminal_state = _rollout_terminal_state(
+                terminal_state, terminal_buffers = _rollout_terminal_handoff(
                     grid, controller_dqp_list, all_train_traj[0], T, H, dQPTH_layer,
-                    disturbance_multiplier=disturbance_multiplier,
-                    resync_line_state_each_step=resync_line_state)
-                _prepare_cycle_handoff_state(grid, terminal_state, cycle_start_state)
+                    resync_line_state_each_step=resync_line_state, cycle=cycle)
+                _prepare_cycle_handoff_state(
+                    grid, terminal_state, terminal_buffers, cycle_start_state)
                 handoff_source = "training reference rollout terminal state"
+            n_issued = (
+                len(grid.init_action_buffers["issued_curt"])
+                if grid.init_action_buffers is not None else 0
+            )
+            n_pending = (
+                len(grid.init_action_buffers["pending_curt"])
+                if grid.init_action_buffers is not None else 0
+            )
             _sync_cycle_start_references(grid, controller_dqp_list)
-            _reproject_line_margins(
-                grid, controller_dqp_list, total_max_margin, total_min_margin, repair_boundary=True)
+            # Same sum-projection as before; overloaded t=0 repair (if needed) runs in
+            # _ensure_cycle_start_feasible at the start of the next cycle only.
+            _reproject_line_margins(grid, controller_dqp_list, total_max_margin, total_min_margin)
             dQPTH_layer.clear_cache()
             print(
                 f"Cycle {cycle + 1} complete; next cycle starts from {handoff_source} "
-                f"(dist_mult={disturbance_multiplier})",
+                f"({n_issued} issued, {n_pending} pending action buffer(s); "
+                f"carrying learned line margins)",
                 flush=True)
 
     line_max_changes = torch.zeros(num_agents, T_horizon + H, grid.num_lines)
@@ -1267,9 +1540,7 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
     ckpt["line_max_changes"] = line_max_changes
     ckpt["line_min_changes"] = line_min_changes
     ckpt["num_cycles"] = num_cycles
-    ckpt["period"] = period
-    ckpt["epochs_per_cycle"] = max_epochs
-    ckpt["zero_noise_epochs"] = zero_noise_epochs
+    ckpt["epochs_per_cycle"] = epochs
     ckpt["T_per_cycle"] = T
     ckpt["T_horizon"] = T_horizon
     if num_cycles == 1:
@@ -1286,6 +1557,7 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
         ckpt["total_terminal_losses_per_iter"] = total_terminal_losses
     ckpt["lr_reduction_epochs"] = lr_reduction_epochs
     ckpt["optimal_comparison"] = optimal_comparison
+    ckpt["dec_comparison"] = dec_comparison
     ckpt["cycle_test_results"] = cycle_test_results
     ckpt["run_failed"] = run_failed
     ckpt["fail_message"] = fail_message
@@ -1326,24 +1598,16 @@ def plot_cycle_epoch_losses(ckpt, *, save_path=None, show=False):
     if total.ndim == 1:
         total = total.unsqueeze(0)
 
-    num_cycles, epochs = total.shape
-    period = ckpt.get("period")
-    if period is None:
-        period = [1.0, 0.0] if ckpt.get("alternating", False) else [1.0]
-    period = _normalize_period(period)
-    epochs_per_cycle = ckpt.get("epochs_per_cycle", epochs)
+    num_cycles, epochs_per_cycle = total.shape
+    epochs_per_cycle = ckpt.get("epochs_per_cycle", epochs_per_cycle)
 
     fig, ax = plt.subplots(figsize=(9, 5))
     x = np.arange(1, epochs_per_cycle + 1)
     colors = _cycle_plot_colors(num_cycles)
     for cycle in range(num_cycles):
-        label = f"Cycle {cycle + 1}"
-        multiplier = _cycle_disturbance_multiplier(cycle, period)
-        if multiplier != 1.0 or len(period) > 1:
-            label += f" (dist mult {multiplier:g})"
         ax.plot(
             x, np.maximum(total[cycle].numpy(), 1e-6),
-            marker="o", markersize=4, label=label, color=colors[cycle],
+            marker="o", markersize=4, label=f"Cycle {cycle + 1}", color=colors[cycle],
         )
 
     ax.set_xlabel("Epoch")
@@ -1380,7 +1644,8 @@ def eval_limits_surrogate(grid, line_max_changes, line_min_changes, T, H, all_tr
 
     controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, H, T, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost, line_terminal_cost=line_terminal_cost,
-                                                            batt_curt_terminal_cost=batt_curt_terminal_cost)
+                                                            batt_curt_terminal_cost=batt_curt_terminal_cost,
+                                                            soft_bus_constraints=True)
     print("hi 2", flush=True)
     pool = mp.Pool(processes=num_agents)
     settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
@@ -1476,7 +1741,8 @@ def eval_limits_rollout(grid, line_max_changes, line_min_changes, T, H, all_trai
 
     controller_dqp_list = controller_utils.create_split_constraint_controllers(grid, num_agents, partition, T, H, batt_cost, curt_change_cost,
                                                             curt_net_cost, bus_slack_cost, line_slack_cost, line_terminal_cost=line_terminal_cost,
-                                                            batt_curt_terminal_cost=batt_curt_terminal_cost)
+                                                            batt_curt_terminal_cost=batt_curt_terminal_cost,
+                                                            soft_bus_constraints=True)
     pool = mp.Pool(processes=num_agents)
     settings = dQPTH.build_settings(solve_type="sparse", qp_solver="gurobi", lin_solver="qdldl", warm_start_from_previous=True)
     dQPTH_layer = dQPTH.dQPTH_layer(settings=settings, pool=pool)
