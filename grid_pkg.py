@@ -1,63 +1,120 @@
 import torch
 
 class Grid:
-    """Tracks and updates grid state with linearized dynamics.
+    """Captures grid state and dynamics
 
-    Agnostic to control strategy or communication structure; only models grid physics (line flows,
-    batteries, and curtailable generation).
+    Tracks and updates line flows, batteries and curtailment in a grid with linearized dynamics.
+    Agnostic to control strategy or communication structure, only considers grid physics.
 
     Attributes:
-        state_dim (int): Dimension of the state vector.
-        num_buses (int): Number of buses on the grid.
-        num_lines (int): Number of lines on the grid.
-        num_curt (int): Number of buses with curtailable generation.
-        num_batt (int): Number of batteries on the grid.
-        state (torch.Tensor): Shape (state_dim,); current state ordered as
-            [line_flows, batt_charge, batt_power_injection, curtailed_power].
-        init_state (torch.Tensor): Shape (state_dim,); initial state vector.
-        bus_with_curt (torch.Tensor): Shape (num_curt,); bus indices with curtailable generation.
-        bus_with_batt (torch.Tensor): Shape (num_batt,); bus indices with a battery.
-        delta_t (float): Time between grid updates (seconds).
-        line_data (torch.Tensor): Raw branch data from MATPOWER test case.
-        bus_data (torch.Tensor): Raw bus data from MATPOWER test case.
-        gen_data (torch.Tensor): Raw generator data from MATPOWER test case.
-        M (torch.Tensor): Shape (num_lines, num_buses); PTDF sensitivity matrix.
-        A (torch.Tensor): Shape (state_dim, state_dim); state transition matrix (no actions or noise).
-        B_curt (torch.Tensor): Shape (state_dim, num_curt); impact of curtailment on state.
-        B_batt (torch.Tensor): Shape (state_dim, num_batt); impact of battery actions on state.
-        B_noise (torch.Tensor): Shape (state_dim, num_buses); impact of bus noise on state.
-        H_x (torch.Tensor): Constraint matrix; H_x @ state <= H_limit.
-        H_limit (torch.Tensor): Constraint RHS vector.
-        line_limits (torch.Tensor): Shape (num_lines,); max power flow magnitude per line.
-        batt_charge_max_limits (torch.Tensor): Shape (num_batt,); max battery charge.
-        batt_charge_min_limits (torch.Tensor): Shape (num_batt,); min battery charge.
-        batt_power_max_limits (torch.Tensor): Shape (num_batt,); max battery power injection.
-        batt_power_min_limits (torch.Tensor): Shape (num_batt,); min battery power injection.
-        curt_max_limits (torch.Tensor): Shape (num_curt,); max curtailable power per generator.
-        curt_min_limits (torch.Tensor): Shape (num_curt,); min curtailable power per generator.
-        target_batt_charges (torch.Tensor): Shape (num_batt,); target charge level per battery.
-        state_line_flow_idx (slice): Index slice for line flows in state vector.
-        state_batt_charge_idx (slice): Index slice for battery charges in state vector.
-        state_curt_idx (slice): Index slice for curtailment in state vector.
+    state_dim (int):
+        Dimension of the grid state vector
+    bus_slack_dim (int):
+        Dimension of the grid slack vector associated with bus-specific constraints.
+    num_buses (int):
+        Number of buses on the grid
+    num_lines (int):
+        Number of lines on the grid
+    num_curt (int):
+        Number of buses with curtailable generation on the grid
+    num_batt (int):
+        Number of batteries on the grid
+    state (Torch matrix, shape (state_dim)):
+        Vector containing current state of the grid, order is:
+        - line flows
+        - battery charge
+        - battery power injection (positive if power goes from battery to grid)
+        - curtailed power
+    init_state (Torch matrix, shape (state_dim)):
+        Initial state vector
+    bus_with_curt (Torch matrix, shape (num_curt)):
+        List of bus numbers with curtailable generation, contains int values
+    bus_with_batt (Torch matrix, shape (num_batt)):
+        List of bus numbers with a battery, contains int values
+    delta_t (Double):
+        Time between grid updates
+    line_data (Torch matrix):
+        Contains raw line data from MATPOWER test case
+    bus_data (Torch matrix):
+        Contains raw bus data from MATPOWER test case
+    gen_data (Torch matrix):
+        Contains raw generator data from MATPOWER test case
+    M (Torch matrix, shape (num_lines, num_buses)):
+        Sensitivity matrix for changes in line flow vs power injection, part of linearized dynamics
+    M_curt (Torch matrix, shape (num_lines, num_curt)):
+        Sensitivity matrix for changes in line flow vs curtailment, submatrix of M
+    M_batt (Torch matrix, shape (num_lines, num_batt)):
+        Sensitivity matrix for changes in line flow vs battery action, submatrix of M
+    M_noise (Torch matrix, shape (num_lines, num_buses)):
+        Sensitivity matrix for changes in line flow vs buses, submatrix of M
+    A (Torch matrix, shape (state_dim, state_dim)):
+        State transition dynamics, absent actions or noise
+    B_curt (Torch matrix, shape (state_dim, num_curt)):
+        Matrix that gives impact of curtailment actions on grid state
+    B_batt (Torch matrix, shape (state_dim, num_batt)):
+        Matrix that gives impact of battery actions on grid state
+    B_noise (Torch matrix, shape (state_dim, num_buses)):
+        Matrix that gives impact of noise at each bus on grid state
+    H_x (Torch matrix, shape (2*state_dim, state_dim)):
+        Matrix associated with state constraint, H_x @ state <= H_limit
+    H_limit (Torch matrix, shape (2*state_dim)):
+        Vector associated with state constraint, H_x @ state <= H_limit
+    line_limits (Torch matrix, (num_line)):
+        Maximum power flow magnitude across each line
+    batt_charge_max_limits (Torch matrix, (num_batt)):
+        Maximum charge for each battery
+    batt_charge_min_limits (numpy array, (num_batt)):
+        Minimum charge for each battery
+    batt_power_max_limits (Torch matrix, (num_batt)):
+        Maximum power injection for each battery
+    batt_power_min_limits (Torch matrix, (num_batt)):
+        Minimum power injection for each battery
+    curt_max_values (Torch matrix, (num_curt)):
+        Maximum amount of power that can be curtailed at each generator
+    curt_min_values (Torch matrix, (num_curt)):
+        Minimum amount of power that can be curtailed at each generator
+    target_batt_charges (Torch matrix, (num_batt)):
+        Vector containing target charge level for each battery.
+    state_batt_charge_idx (Slice object):
+        Indices for getting battery charges from overall state vector.
+    state_line_flow_idx (Slice object):
+        Indices for getting line flow from overall state vector.
+    state_curt_idx (Slice object):
+        Indices for getting curtailment from overall state vector.
     """
 
-    def __init__(self, bus_with_curt, bus_with_batt, delta_t, line_data_loc, bus_data_loc, gen_data_loc, ptdf_data_loc):
+    def __init__(self, bus_with_curt, bus_with_batt, delta_t, line_data_loc, bus_data_loc, gen_data_loc, ptdf_data_loc,
+                 control_delay=0):
         """
         Args:
-            bus_with_curt (torch.Tensor): Shape (num_curt,); bus indices with curtailable generation.
-            bus_with_batt (torch.Tensor): Shape (num_batt,); bus indices with a battery.
-            delta_t (float): Time between grid updates (seconds).
-            line_data_loc (str): Path to branch data file (.npy, MATPOWER format).
-            bus_data_loc (str): Path to bus data file (.npy, MATPOWER format).
-            gen_data_loc (str): Path to generator data file (.npy, MATPOWER format).
-            ptdf_data_loc (str): Path to PTDF matrix file used as sensitivity matrix M.
+            bus_with_curt (Torch matrix, shape (num_curt)):
+                List of bus numbers with curtailable generation, contains int values
+            bus_with_batt (Torch matrix, shape (num_batt)):
+                List of bus numbers with a battery, contains int values
+            delta_t (Double):
+                Time between grid updates
+            control_delay (int):
+                Number of timesteps between issuing a control action and its effect on grid state.
+                Zero means immediate effect (default).
+            line_data_loc (String):
+                Location of branch data file
+            bus_data_loc (String):
+                Location of bus data file
+            gen_data_loc (String):
+                Location of generator data file
+            ptdf_data_loc (String):
+                Location of ptdf data file. We currently use the ptdf matrix from MATPOWER for sensitivity matrix M.
 
         Notes:
-            Buses and lines are 0-indexed. Data files use the MATPOWER case format stored as .npy arrays.
+            We assume that buses and lines are all 0-indexed. Data is stored in a .npy format, organized in the
+            MATPOWER case format. See https://matpower.org/docs/ref/matpower5.0/case30.html for an example.
         """
         self.bus_with_curt = bus_with_curt
         self.bus_with_batt = bus_with_batt
         self.delta_t = float(delta_t)
+        if control_delay < 0:
+            raise ValueError(f"control_delay {control_delay} is negative.")
+        self.control_delay = int(control_delay)
         self.line_data = torch.load(line_data_loc, weights_only=True)
         self.bus_data = torch.load(bus_data_loc, weights_only=True)
         self.gen_data = torch.load(gen_data_loc, weights_only=True)
@@ -77,7 +134,12 @@ class Grid:
         self.set_matrices()
 
         self.init_state = torch.cat([init_line_flows, init_batt_charges, init_batt_powers, init_curt_values])
+        self.baseline_init_state = self.init_state.clone()
+        self.baseline_target_batt_charges = self.target_batt_charges.clone()
+        # When set (multi-cycle handoff), reset_state() restores these delay queues with init_state.
+        self.init_action_buffers = None
         self.state = self.init_state
+        self._reset_action_buffers()
 
         self.state_line_flow_idx = slice(0, self.num_lines)
         self.state_batt_charge_idx = slice(self.num_lines, self.num_lines + self.num_batt)
@@ -87,16 +149,17 @@ class Grid:
 
 
     def check_state_feasible(self, tol=1e-3):
-        """Checks if the current grid state is feasible.
+        """
+        Checks if the current state is feasible.
 
         Args:
-            tol (float): Maximum acceptable constraint violation.
+            tol: (float) maximum acceptable infeasibility
 
         Returns:
-            tuple:
-                - bool: True if feasible.
-                - torch.Tensor: Indices of infeasible constraints.
-                - torch.Tensor: Violation amounts at those indices.
+            bool: True if state is feasible, False otherwise
+            infeasible_idx: (numpy array) indices where the state is infeasible
+            violations: (numpy array) violation amounts
+
         """
         gap = self.H_x @ self.state - self.H_limit
         infeasible_idx = torch.where(gap > tol)[0]
@@ -104,16 +167,28 @@ class Grid:
 
 
     def add_agent(self, agent):
-        """Adds an agent to the grid's agent list.
+        """
+        Adds an agent to the grid.
 
         Args:
-            agent: Agent to add.
+            agent
+
+        Returns:
+            None
         """
         self.agents.append(agent)
 
 
     def set_matrices(self):
-        """Constructs matrices for grid dynamics and constraints."""
+        """
+        Function that constructs matrices associated with dynamics and constraints.
+
+        Args:
+            self
+
+        Returns:
+            None
+        """
         self.M_curt = self.M[:, self.bus_with_curt]
         self.M_batt = self.M[:, self.bus_with_batt]
         self.M_noise = self.M
@@ -155,12 +230,15 @@ class Grid:
 
 
     def init_batteries(self):
-        """Initializes battery limits and starting charge/power values.
+        """
+        Creates min/max limits on battery charge and power injection, and initializes battery charge.
+
+        Args:
+            self
 
         Returns:
-            tuple:
-                - init_batt_charges (torch.Tensor): Shape (num_batt,); initial battery charges.
-                - init_batt_powers (torch.Tensor): Shape (num_batt,); initial battery power injections.
+            init_batt_charges: (numpy array) initial values for the batt charge (num_batt,)
+            init_batt_powers: (numpy array) initial values for battery power injection (num_batt,)
         """
         # assuming that batteries can collectively meet 5% of total average instantaneous demand
         total_demand = torch.sum(self.bus_data[:,2])
@@ -174,7 +252,7 @@ class Grid:
 
         # assuming that all batteries have the same power storage capacity
         self.batt_charge_max_limits = torch.ones(self.num_batt) * (total_max / self.num_batt) / 3600    # conver to MWh
-        self.batt_charge_min_limits = torch.zeros(self.num_batt)
+        self.batt_charge_min_limits = torch.zeros(self.num_batt)  # 'charge' actually means work or energy in physics
 
         # init_batt_charges = self.batt_charge_min_limits\
         #       + np.random.rand(self.num_batt) * (self.batt_charge_max_limits - self.batt_charge_min_limits)
@@ -189,10 +267,14 @@ class Grid:
 
 
     def init_curt(self):
-        """Initializes curtailment limits and starting values.
+        """
+        Creates a list of curtailment limits.
+
+        Args:
+            self
 
         Returns:
-            torch.Tensor: Shape (num_curt,); initial curtailed power per generator.
+            init_curt_values: (numpy array) initial values for the amount of power being curtailed (num_ges,)
         """
         self.curt_max_limits = self.gen_data[:,8]
         self.curt_min_limits = torch.zeros(self.num_curt)
@@ -201,28 +283,153 @@ class Grid:
         return init_curt_values
 
 
+    def _reset_action_buffers(self):
+        """Clear issued-action history and pending delay queue."""
+        self._pending_actions_curt = []
+        self._pending_actions_batt = []
+        self._issued_actions_curt = []
+        self._issued_actions_batt = []
+        # Effective (actually-applied) action from the most recent update_state; zero until the
+        # first controlled step. Losses penalize this rather than the freshly-predicted action so
+        # the cost reflects what physically hit the grid under control_delay.
+        self.effective_curt = torch.zeros(self.num_curt)
+        self.effective_batt = torch.zeros(self.num_batt)
+
+
+    def snapshot_action_buffers(self):
+        """Deep-copy pending/issued delay queues and last effective actions."""
+        return {
+            "pending_curt": [a.detach().clone() for a in self._pending_actions_curt],
+            "pending_batt": [a.detach().clone() for a in self._pending_actions_batt],
+            "issued_curt": [a.detach().clone() for a in self._issued_actions_curt],
+            "issued_batt": [a.detach().clone() for a in self._issued_actions_batt],
+            "effective_curt": self.effective_curt.detach().clone(),
+            "effective_batt": self.effective_batt.detach().clone(),
+        }
+
+
+    def restore_action_buffers(self, snapshot):
+        """Restore delay queues from ``snapshot_action_buffers()`` (or clear if ``None``)."""
+        if snapshot is None:
+            self._reset_action_buffers()
+            return
+        self._pending_actions_curt = [a.clone() for a in snapshot["pending_curt"]]
+        self._pending_actions_batt = [a.clone() for a in snapshot["pending_batt"]]
+        self._issued_actions_curt = [a.clone() for a in snapshot["issued_curt"]]
+        self._issued_actions_batt = [a.clone() for a in snapshot["issued_batt"]]
+        self.effective_curt = snapshot["effective_curt"].clone()
+        self.effective_batt = snapshot["effective_batt"].clone()
+
+
+    def set_cycle_handoff(self, terminal_state, action_buffers=None):
+        """Seed the next cycle from a terminal plant state and matching delay buffers."""
+        self.init_state = terminal_state.detach().clone()
+        if action_buffers is None:
+            self.init_action_buffers = None
+        else:
+            # Snapshot once so later resets don't share live tensors with the capture site.
+            self.init_action_buffers = {
+                "pending_curt": [a.detach().clone() for a in action_buffers["pending_curt"]],
+                "pending_batt": [a.detach().clone() for a in action_buffers["pending_batt"]],
+                "issued_curt": [a.detach().clone() for a in action_buffers["issued_curt"]],
+                "issued_batt": [a.detach().clone() for a in action_buffers["issued_batt"]],
+                "effective_curt": action_buffers["effective_curt"].detach().clone(),
+                "effective_batt": action_buffers["effective_batt"].detach().clone(),
+            }
+
+
     def reset_state(self):
-        """Resets grid state to its initial value."""
+        """
+        Resets state to its original value.
+
+        Args:
+            None
+        Returns:
+            None
+        """
         self.state = self.init_state
+        # Multi-cycle handoff: re-seed delay history so MPC past-action RHS and plant apply
+        # stay consistent with the terminal snapshot (especially control_delay > 0).
+        self.restore_action_buffers(self.init_action_buffers)
+
+
+    def restore_baseline_init(self):
+        """Reset init_state and battery targets to values from grid construction."""
+        self.init_state = self.baseline_init_state.clone()
+        self.target_batt_charges = self.baseline_target_batt_charges.clone()
+        self.init_action_buffers = None
+        self.reset_state()
+
+
+    def get_past_actions(self, horizon_step):
+        """
+        Return the action that affects MPC horizon step ``horizon_step`` when it
+        lies before the current planning window (i.e. ``horizon_step < control_delay``).
+
+        At current time t with control_delay d, the issued queue stores actions
+        oldest-first as [u_{t-L}, ..., u_{t-1}] where L = min(t, d). Horizon
+        step i is driven by the effective action at grid time t+i, which is
+        u_{t+i-d}. Its position in the queue is ``pos = L + i - d``; if
+        ``pos < 0`` the action has not yet been issued and the contribution is
+        zero. This warm-up handling matters when t < d: the queue is shorter
+        than d, so naive index-by-horizon-step would alias future-effective
+        actions onto early horizon rows and double-count them.
+        """
+        if self.control_delay == 0 or horizon_step >= self.control_delay:
+            return torch.zeros(self.num_curt), torch.zeros(self.num_batt)
+        queue_len = len(self._issued_actions_curt)
+        pos = queue_len + horizon_step - self.control_delay
+        if pos < 0 or pos >= queue_len:
+            return torch.zeros(self.num_curt), torch.zeros(self.num_batt)
+        return self._issued_actions_curt[pos], self._issued_actions_batt[pos]
 
 
     def update_state(self, action_curt, action_batt, noise):
-        """Advances the grid state by one timestep given actions and noise.
+        """
+        Updates state of the entire grid based on all the actions and noise across the grid.
 
         Args:
-            action_curt (torch.Tensor): Shape (num_curt,); curtailment at each generator (same order as bus_with_curt).
-            action_batt (torch.Tensor): Shape (num_batt,); battery power injection (same order as bus_with_batt).
-            noise (torch.Tensor): Shape (num_buses,); power injection noise at each bus.
+            action_curt (Torch matrix, shape (num_curt)):
+                Vector containing curtailment actions taken at each generator. Same order as bus_with_curt.
+            action_batt (Torch matrix, shape (num_batt)):
+                Vector containing action taken at each battery. Same order as bus_with_batt.
+            noise (Torch matrix, shape (num_buses)):
+                Vector containing power injection noise across the grid at that timestep.
         """
-        self.state = self.A @ self.state + self.B_curt @ action_curt + self.B_batt @ action_batt + self.B_noise @ noise
+        if self.control_delay == 0:
+            effective_curt, effective_batt = action_curt, action_batt
+        else:
+            self._pending_actions_curt.append(action_curt.clone())
+            self._pending_actions_batt.append(action_batt.clone())
+            if len(self._pending_actions_curt) > self.control_delay:
+                effective_curt = self._pending_actions_curt.pop(0)
+                effective_batt = self._pending_actions_batt.pop(0)
+            else:
+                effective_curt = torch.zeros_like(action_curt)
+                effective_batt = torch.zeros_like(action_batt)
+
+            self._issued_actions_curt.append(action_curt.clone())
+            self._issued_actions_batt.append(action_batt.clone())
+            if len(self._issued_actions_curt) > self.control_delay:
+                self._issued_actions_curt.pop(0)
+                self._issued_actions_batt.pop(0)
+
+        # Expose the action that actually took effect this step (differentiable: it is a clone of an
+        # earlier predicted action for control_delay > 0, or the current prediction for delay 0).
+        self.effective_curt = effective_curt
+        self.effective_batt = effective_batt
+        self.state = self.A @ self.state + self.B_curt @ effective_curt + self.B_batt @ effective_batt + self.B_noise @ noise
 
 
     def get_grid_data(self):
-        """Returns a dict of grid parameters needed by agents.
+        """
+        Retrives all the information that an agent on the grid needs to know.
+
+        Args:
+            None
 
         Returns:
-            dict: Contains num_lines, line_data, num_curt, bus_with_curt, num_batt, bus_with_batt,
-                ptdf, delta_t, and all battery/curtailment limit arrays.
+            grid_data: (dict)
         """
         grid_data = dict()
         grid_data["num_lines"] = self.num_lines
@@ -244,13 +451,16 @@ class Grid:
 
 
     def get_lines_from_buses(self, buses):
-        """Returns line indices and endpoint buses for given bus pairs.
+        """
+        Reports the line index, "from" bus, and "to" bus corresponding to pairs of buses. If there is no line between
+        a pair of buses, reports None for that pair.
 
         Args:
-            buses (list of tuples): Each tuple is a pair of bus numbers to look up.
+            buses: (list of tuples) tuple contains pair of bus numbers
 
         Returns:
-            torch.Tensor: Rows of (line_idx, from_bus, to_bus); entries are None if no line connects the pair.
+            lines: (numpy array) contains rows with line index, "from" bus, and "to" bus, or None if no line connects
+            the pair of buses
         """
         result = []
         for bus_pair in buses:
