@@ -62,7 +62,7 @@ class Base_Controller(nn.Module):
     """
 
     def __init__(self, grid, H, buses_in_area, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
-                 line_terminal_cost=0.0, batt_curt_terminal_cost=0.0, eps=1e-8):
+                 line_terminal_cost=0.0, batt_curt_terminal_cost=0.0, eps=1e-8, soft_bus_constraints=False):
         """
         Args:
             grid (Grid):
@@ -113,6 +113,7 @@ class Base_Controller(nn.Module):
         self.line_slack_cost = line_slack_cost
         self.line_terminal_cost = line_terminal_cost
         self.batt_curt_terminal_cost = batt_curt_terminal_cost
+        self.soft_bus_constraints = soft_bus_constraints
 
         # ---------------- Determine which grid components belong in this controller's region ----------------
         lines_in_area = list()
@@ -232,19 +233,36 @@ class Base_Controller(nn.Module):
             mask[curt_idx:curt_idx + self.num_curt] = True
         return mask
 
+    def _bus_slack_cost_q_mask(self):
+        """Boolean mask of QP decision indices that carry soft bus-limit slack costs."""
+        mask = torch.zeros(self.z_dim, dtype=torch.bool)
+        n_slack = self._qp_bus_slack_per_step()
+        if n_slack and self.bus_slack_start_idx is not None:
+            n = self.H * self.bus_ineq_dim
+            mask[self.bus_slack_start_idx:self.bus_slack_start_idx + n] = True
+        return mask
+
     def _qp_cost_scale_denom(self, raw_q):
-        """Per-variable cost normalizers; terminal terms use their own scale so user weights are effective."""
+        """Per-variable cost normalizers.
+
+        Terminal and bus-slack terms use their own scale so a large ``bus_slack_cost``
+        (e.g. 1e8) does not dominate the running-cost normalizer and dilute
+        ``curt_net`` / battery / line weights relative to hard-bus mode.
+        """
         terminal_mask = self._terminal_cost_q_mask()
-        running_raw = raw_q.masked_fill(terminal_mask, 0.0)
+        bus_slack_mask = self._bus_slack_cost_q_mask()
+        exclude_mask = terminal_mask | bus_slack_mask
+        running_raw = raw_q.masked_fill(exclude_mask, 0.0)
         cost_scale = torch.max(torch.abs(running_raw))
         if float(cost_scale) == 0.0:
             cost_scale = raw_q.new_tensor(1.0)
         scale_denom = torch.full((self.z_dim,), float(cost_scale), dtype=raw_q.dtype, device=raw_q.device)
-        if terminal_mask.any():
-            term_scale = torch.max(torch.abs(raw_q[terminal_mask]))
-            if float(term_scale) == 0.0:
-                term_scale = cost_scale
-            scale_denom[terminal_mask] = term_scale
+        for mask in (terminal_mask, bus_slack_mask):
+            if mask.any():
+                own_scale = torch.max(torch.abs(raw_q[mask]))
+                if float(own_scale) == 0.0:
+                    own_scale = cost_scale
+                scale_denom[mask] = own_scale
         return scale_denom
 
 
@@ -367,24 +385,56 @@ class Base_Controller(nn.Module):
         self._fill_cost_target_vec(target_vec)
         self._apply_cost_linear_terms(target_vec)
 
+    def _qp_bus_slack_per_step(self):
+        """Bus slack variables per horizon step (0 when bus limits are hard constraints)."""
+        return self.bus_ineq_dim if self.soft_bus_constraints else 0
+
+    def _line_flow_limit_scale(self):
+        """Per-line limit scale used for line-state and line-slack normalization."""
+        if self.line_state_dim == self.grid.num_lines:
+            return self.grid.line_data[:, 5]
+        return self.grid.line_data[self.lines_in_area, 5]
+
+    def _configure_qp_index_layout(self, H):
+        """Set QP decision-vector layout; inserts bus slacks when ``soft_bus_constraints`` is True."""
+        bus_slack_block = self._qp_bus_slack_per_step()
+        self.z_dim = H * (self.bus_state_dim + self.line_state_dim + bus_slack_block
+                          + self.line_max_slack_dim + self.line_min_slack_dim
+                          + self.num_batt + self.num_curt)
+        self.eq_dim = H * (self.bus_state_dim + self.line_state_dim)
+        self.ineq_dim = H * (self.bus_ineq_dim + self.line_max_slack_dim + self.line_min_slack_dim)
+        self.line_state_start_idx = H * self.bus_state_dim
+        if bus_slack_block:
+            self.bus_slack_start_idx = self.line_state_start_idx + H * self.line_state_dim
+            self.line_max_slack_start_idx = self.bus_slack_start_idx + H * self.bus_ineq_dim
+        else:
+            self.bus_slack_start_idx = None
+            self.line_max_slack_start_idx = self.line_state_start_idx + H * self.line_state_dim
+        self.line_min_slack_start_idx = self.line_max_slack_start_idx + H * self.line_state_dim
+        self.action_batt_start_idx = self.line_min_slack_start_idx + H * self.line_state_dim
+        self.action_curt_start_idx = self.action_batt_start_idx + H * self.num_batt
+
+    def _add_bus_slack_costs(self, H, true_cost_vec):
+        if not self._qp_bus_slack_per_step():
+            return
+        idx = self.bus_slack_start_idx
+        true_cost_vec[idx:idx + H * self.bus_ineq_dim] = self.bus_slack_cost
+
+    def _add_bus_slack_scales(self, H, scale_vec):
+        if not self._qp_bus_slack_per_step():
+            return
+        slack_scale = torch.clamp(torch.abs(self.H_limit), min=1e-6)
+        for i in range(H):
+            idx = self.bus_slack_start_idx + i * self.bus_ineq_dim
+            scale_vec[idx:idx + self.bus_ineq_dim] = slack_scale
 
     def init_matrices(self):
-        # ----------------------------------------------------------------------------------------
-        # aggregate vector is bus state, line state, line max slack, line min slack, batt action, curt action
-        self.z_dim = self.H * (self.bus_state_dim + self.line_state_dim + self.line_max_slack_dim \
-                            + self.line_min_slack_dim + self.num_batt + self.num_curt)
-        self.eq_dim = self.H * (self.bus_state_dim + self.line_state_dim)
-        self.ineq_dim = self.H * (self.bus_ineq_dim + self.line_max_slack_dim + self.line_min_slack_dim)
+        # bus state, line state, [bus slack], line max/min slack, batt action, curt action
+        H = self.H
+        self._configure_qp_index_layout(H)
 
         true_cost_vec = torch.zeros(self.z_dim)
         target_vec = torch.zeros(self.z_dim)
-
-        self.line_state_start_idx = self.H * self.bus_state_dim
-        self.line_max_slack_start_idx = self.line_state_start_idx + self.H * self.line_state_dim
-        self.line_min_slack_start_idx = self.line_max_slack_start_idx + self.H * self.line_state_dim
-
-        self.action_batt_start_idx = self.line_min_slack_start_idx + self.H * self.line_state_dim
-        self.action_curt_start_idx = self.action_batt_start_idx + self.H * self.num_batt
 
         # -------- Create Q and q matrices --------
         for i in range(self.H):
@@ -409,6 +459,7 @@ class Base_Controller(nn.Module):
         idx = self.line_min_slack_start_idx
         true_cost_vec[idx:idx+self.H*self.line_min_slack_dim] = self.line_slack_cost * torch.ones(self.H*self.line_min_slack_dim)
 
+        self._add_bus_slack_costs(H, true_cost_vec)
         self._add_terminal_line_flow_cost(true_cost_vec, target_vec)
         self._add_terminal_batt_curt_cost(true_cost_vec, target_vec)
 
@@ -419,7 +470,7 @@ class Base_Controller(nn.Module):
         # -------- Create A matrix --------
         self.A = torch.zeros(self.eq_dim, self.z_dim)
         # evolution of bus states
-        for i in range(self.H):
+        for i in range(H):
             block_row = torch.zeros(self.bus_state_dim, self.z_dim)
             action_batt_idx = i * self.num_batt + self.action_batt_start_idx
             action_curt_idx = i * self.num_curt + self.action_curt_start_idx
@@ -433,7 +484,7 @@ class Base_Controller(nn.Module):
             self.A[row_idx:row_idx+self.bus_state_dim] = block_row
 
         # evolution of line states
-        for i in range(self.H):
+        for i in range(H):
             action_batt_idx = i * self.num_batt + self.action_batt_start_idx
             action_curt_idx = i * self.num_curt + self.action_curt_start_idx
             block_row = torch.zeros(self.line_state_dim, self.z_dim)
@@ -444,20 +495,23 @@ class Base_Controller(nn.Module):
             block_row[:,idx:idx+self.line_state_dim] = torch.eye(self.line_state_dim)
             self._couple_line_actions_to_dynamics_row(block_row, i)
 
-            row_idx = i * self.line_state_dim + self.H * self.bus_state_dim
+            row_idx = i * self.line_state_dim + H * self.bus_state_dim
             self.A[row_idx:row_idx+self.line_state_dim] = block_row
         # --------------------------------
 
         # -------- Create G matrix --------
         self.G = torch.zeros(self.ineq_dim, self.z_dim)
-        for i in range(self.H):
+        for i in range(H):
             block_row = torch.zeros(self.bus_ineq_dim, self.z_dim)
             block_row[:,i*self.bus_state_dim:(i+1)*self.bus_state_dim] = self.H_x
+            if self._qp_bus_slack_per_step():
+                slack_idx = self.bus_slack_start_idx + i * self.bus_ineq_dim
+                block_row[:, slack_idx:slack_idx + self.bus_ineq_dim] = -torch.eye(self.bus_ineq_dim)
 
             row_idx = i * self.bus_ineq_dim
             self.G[row_idx:row_idx+self.bus_ineq_dim] = block_row
 
-        for i in range(self.H):
+        for i in range(H):
             block_row = torch.zeros(self.line_state_dim, self.z_dim)
             line_state_idx = i * self.line_state_dim + self.line_state_start_idx
             line_max_slack_idx = i * self.line_max_slack_dim + self.line_max_slack_start_idx
@@ -465,10 +519,10 @@ class Base_Controller(nn.Module):
             block_row[:,line_state_idx:line_state_idx+self.line_state_dim] = torch.eye(self.line_state_dim)
             block_row[:,line_max_slack_idx:line_max_slack_idx+self.line_state_dim] = -torch.eye(self.line_max_slack_dim)
 
-            row_idx = i * self.line_state_dim + self.H * self.bus_ineq_dim
+            row_idx = i * self.line_state_dim + H * self.bus_ineq_dim
             self.G[row_idx:row_idx+self.line_state_dim] = block_row
 
-        for i in range(self.H):
+        for i in range(H):
             block_row = torch.zeros(self.line_state_dim, self.z_dim)
             line_state_idx = i * self.line_state_dim + self.line_state_start_idx
             line_min_slack_idx = i * self.line_min_slack_dim + self.line_min_slack_start_idx
@@ -476,7 +530,7 @@ class Base_Controller(nn.Module):
             block_row[:,line_state_idx:line_state_idx+self.line_state_dim] = -torch.eye(self.line_state_dim)
             block_row[:,line_min_slack_idx:line_min_slack_idx+self.line_state_dim] = -torch.eye(self.line_min_slack_dim)
 
-            row_idx = i * self.line_state_dim + self.H * (self.bus_ineq_dim + self.line_state_dim)
+            row_idx = i * self.line_state_dim + H * (self.bus_ineq_dim + self.line_state_dim)
             self.G[row_idx:row_idx+self.line_state_dim] = block_row
         # ----------------------------------------
         # self.nBatch = 1
@@ -484,9 +538,10 @@ class Base_Controller(nn.Module):
         # G_, _ = qpth.util.expandParam(self.G, self.nBatch, 3)
         # A_, _ = qpth.util.expandParam(self.A, self.nBatch, 3)
         # ------------ Construct scaling matrices ------------
+        line_limit_scale = self._line_flow_limit_scale()
         scale_vec = torch.zeros(self.z_dim)
         # bus states
-        for i in range(self.H):
+        for i in range(H):
             # battery charge 
             idx = i * self.bus_state_dim
             scale_vec[idx:idx+self.num_batt] = self.grid.target_batt_charges[self.batt_idx]
@@ -500,21 +555,23 @@ class Base_Controller(nn.Module):
             scale_vec[idx:idx+self.num_curt] = self.grid.curt_max_limits[self.curt_idx]
 
         # line state
-        for i in range(self.H):
+        for i in range(H):
             idx = self.line_state_start_idx + i * self.line_state_dim
-            scale_vec[idx:idx+self.line_state_dim] = self.grid.line_data[self.lines_in_area,5]
+            scale_vec[idx:idx+self.line_state_dim] = line_limit_scale
+
+        self._add_bus_slack_scales(H, scale_vec)
 
         # line max slack
-        for i in range(self.H):
+        for i in range(H):
             idx = self.line_max_slack_start_idx + i * self.line_max_slack_dim
-            scale_vec[idx:idx+self.line_max_slack_dim] = self.grid.line_data[self.lines_in_area,5]
-        self.line_max_slack_scale_vec = self.grid.line_data[:,5]
+            scale_vec[idx:idx+self.line_max_slack_dim] = line_limit_scale
+        self.line_max_slack_scale_vec = line_limit_scale
 
         # line min slack
-        for i in range(self.H):
+        for i in range(H):
             idx = self.line_min_slack_start_idx + i * self.line_min_slack_dim
-            scale_vec[idx:idx+self.line_min_slack_dim] = self.grid.line_data[self.lines_in_area,5]
-        self.line_min_slack_scale_vec = self.grid.line_data[:,5]
+            scale_vec[idx:idx+self.line_min_slack_dim] = line_limit_scale
+        self.line_min_slack_scale_vec = line_limit_scale
 
         # batt action
         for i in range(self.H):
@@ -538,8 +595,19 @@ class Base_Controller(nn.Module):
         GD = torch.mul(self.G, scale_vec)
         F_vec = torch.zeros(self.ineq_dim)
         eps = 1e-6
+        bus_rows = self.H * self.bus_ineq_dim
         for i in range(self.ineq_dim):
-            F_vec[i] = 1 / (torch.linalg.norm(GD[i]) + eps)
+            row = GD[i]
+            # Soft bus adds slack columns to bus-inequality rows; exclude them from the
+            # row-norm so F scaling matches hard-bus mode (keeps curt_net solutions aligned
+            # whenever a hard-feasible point exists and slacks stay at 0).
+            if self._qp_bus_slack_per_step() and i < bus_rows:
+                step = i // self.bus_ineq_dim
+                k = i % self.bus_ineq_dim
+                slack_col = self.bus_slack_start_idx + step * self.bus_ineq_dim + k
+                row = row.clone()
+                row[slack_col] = 0
+            F_vec[i] = 1 / (torch.linalg.norm(row) + eps)
         
         self.E_vec = E_vec
         self.F_vec = F_vec
@@ -693,6 +761,12 @@ class Base_Controller(nn.Module):
         for i in range(self.H):
             line_min_slacks[i] = z[i*self.line_min_slack_dim+self.line_min_slack_start_idx:(i+1)*self.line_min_slack_dim+self.line_min_slack_start_idx]
 
+        bus_slacks = None
+        if self._qp_bus_slack_per_step():
+            bus_slacks = torch.zeros(self.H, self.bus_ineq_dim)
+            for i in range(self.H):
+                bus_slacks[i] = z[i*self.bus_ineq_dim+self.bus_slack_start_idx:(i+1)*self.bus_ineq_dim+self.bus_slack_start_idx]
+
         self.target_charges = self.grid.target_batt_charges[self.batt_idx]
         objective = 0
         batt_obj = 0
@@ -711,6 +785,8 @@ class Base_Controller(nn.Module):
                 curt_net_obj += self.curt_net_cost * torch.sum(bus_states[i][self.bus_state_curt_idx]**2)
                 objective += self.line_slack_cost * torch.sum(line_max_slacks[i]**2)
                 objective += self.line_slack_cost * torch.sum(line_min_slacks[i]**2)
+                if bus_slacks is not None:
+                    objective += self.bus_slack_cost * torch.sum(bus_slacks[i]**2)
             if self.line_terminal_cost > 0:
                 terminal_line = line_states[self.H - 1]
                 objective += self.line_terminal_cost * torch.sum(
@@ -723,7 +799,7 @@ class Base_Controller(nn.Module):
             self.bus_state = bus_states[0]
             self.line_state = line_states[0]
 
-        return bus_states, line_states, actions_curt, actions_batt, None, line_max_slacks, line_min_slacks, objective
+        return bus_states, line_states, actions_curt, actions_batt, bus_slacks, line_max_slacks, line_min_slacks, objective
 
 from enum import Enum
 
@@ -783,7 +859,7 @@ class Split_Constraint_Controller(Base_Controller):
 
     def __init__(self, grid, H, buses_in_area, init_line_max, init_line_min, batt_cost, curt_change_cost,
                  curt_net_cost, bus_slack_cost, line_slack_cost, line_terminal_cost=0.0,
-                 batt_curt_terminal_cost=0.0, eps=1e-8):
+                 batt_curt_terminal_cost=0.0, eps=1e-8, soft_bus_constraints=False):
         """
         Args:
             grid (Grid):
@@ -812,7 +888,8 @@ class Split_Constraint_Controller(Base_Controller):
             None
         """
         super().__init__(grid, H, buses_in_area, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
-                         line_terminal_cost=line_terminal_cost, batt_curt_terminal_cost=batt_curt_terminal_cost, eps=eps)
+                         line_terminal_cost=line_terminal_cost, batt_curt_terminal_cost=batt_curt_terminal_cost, eps=eps,
+                         soft_bus_constraints=soft_bus_constraints)
         self.register_buffer("init_line_max_change_buf", init_line_max.clone())
         self.register_buffer("init_line_min_change_buf", init_line_min.clone())
         self.line_max_change = nn.Parameter(self.init_line_max_change_buf.clone())
@@ -827,218 +904,7 @@ class Split_Constraint_Controller(Base_Controller):
         self.line_B_curt = self.grid.B_curt[0:self.grid.num_lines,self.curt_idx]
         self.line_B_batt = self.grid.B_batt[0:self.grid.num_lines,self.batt_idx]
         self.line_B_noise = self.grid.B_noise[0:self.grid.num_lines,self.buses_in_area]
-        # ----------------------------------------------------------------------------------------
-        # aggregate vector is bus state, line state, line max slack, line min slack, batt action, curt action
-        self.z_dim = H * (self.bus_state_dim + self.line_state_dim + self.line_max_slack_dim \
-                            + self.line_min_slack_dim + self.num_batt + self.num_curt)
-        self.eq_dim = H * (self.bus_state_dim + self.line_state_dim)
-        self.ineq_dim = H * (self.bus_ineq_dim + self.line_max_slack_dim + self.line_min_slack_dim)
-
-        true_cost_vec = torch.zeros(self.z_dim)
-        target_vec = torch.zeros(self.z_dim)
-
-        self.line_state_start_idx = H * self.bus_state_dim
-        self.line_max_slack_start_idx = self.line_state_start_idx + H * self.line_state_dim
-        self.line_min_slack_start_idx = self.line_max_slack_start_idx + H * self.line_state_dim
-
-        self.action_batt_start_idx = self.line_min_slack_start_idx + H * self.line_state_dim
-        self.action_curt_start_idx = self.action_batt_start_idx + H * self.num_batt
-
-        # -------- Create Q and q matrices --------
-        for i in range(self.H):
-            # battery charge targets and costs
-            idx = i * self.bus_state_dim
-            true_cost_vec[idx:idx+self.num_batt] = batt_cost * torch.ones(self.num_batt)
-            target_vec[idx:idx+self.num_batt] = self.grid.target_batt_charges[self.batt_idx]
-
-            # net curtailment costs (penalize absolute curtailment level toward zero)
-            idx = i * self.bus_state_dim + 2 * self.num_batt
-            true_cost_vec[idx:idx+self.num_curt] = curt_net_cost * torch.ones(self.num_curt)
-
-        # curt action costs
-        idx = self.action_curt_start_idx
-        true_cost_vec[idx:idx+H*self.num_curt] = curt_change_cost * torch.ones(H*self.num_curt)
-
-        # line max slack costs
-        idx = self.line_max_slack_start_idx
-        true_cost_vec[idx:idx+H*self.line_max_slack_dim] = line_slack_cost * torch.ones(H*self.line_max_slack_dim)
-
-        # line min slack costs
-        idx = self.line_min_slack_start_idx
-        true_cost_vec[idx:idx+H*self.line_min_slack_dim] = line_slack_cost * torch.ones(H*self.line_min_slack_dim)
-
-        self._add_terminal_line_flow_cost(true_cost_vec, target_vec)
-        self._add_terminal_batt_curt_cost(true_cost_vec, target_vec)
-
-        self.true_cost_vec = true_cost_vec
-
-        # ----------------------------------------
-
-        # -------- Create A matrix --------
-        self.A = torch.zeros(self.eq_dim, self.z_dim)
-        # evolution of bus states
-        for i in range(H):
-            block_row = torch.zeros(self.bus_state_dim, self.z_dim)
-            action_batt_idx = i * self.num_batt + self.action_batt_start_idx
-            action_curt_idx = i * self.num_curt + self.action_curt_start_idx
-
-            if not i == 0:
-                block_row[:,(i-1)*self.bus_state_dim:i*self.bus_state_dim] = -self.bus_A
-            block_row[:,i*self.bus_state_dim:(i+1)*self.bus_state_dim] = torch.eye(self.bus_state_dim)
-            self._couple_bus_actions_to_dynamics_row(block_row, i)
-
-            row_idx = i * self.bus_state_dim
-            self.A[row_idx:row_idx+self.bus_state_dim] = block_row
-
-        # evolution of line states
-        for i in range(H):
-            action_batt_idx = i * self.num_batt + self.action_batt_start_idx
-            action_curt_idx = i * self.num_curt + self.action_curt_start_idx
-            block_row = torch.zeros(self.line_state_dim, self.z_dim)
-
-            idx = i * self.line_state_dim + self.line_state_start_idx
-            if not i == 0:
-                block_row[:,idx-self.line_state_dim:idx] = -torch.eye(self.line_state_dim)
-            block_row[:,idx:idx+self.line_state_dim] = torch.eye(self.line_state_dim)
-            self._couple_line_actions_to_dynamics_row(block_row, i)
-
-            row_idx = i * self.line_state_dim + H * self.bus_state_dim
-            self.A[row_idx:row_idx+self.line_state_dim] = block_row
-        # --------------------------------
-
-        # -------- Create G matrix --------
-        self.G = torch.zeros(self.ineq_dim, self.z_dim)
-        for i in range(H):
-            block_row = torch.zeros(self.bus_ineq_dim, self.z_dim)
-            block_row[:,i*self.bus_state_dim:(i+1)*self.bus_state_dim] = self.H_x
-
-            row_idx = i * self.bus_ineq_dim
-            self.G[row_idx:row_idx+self.bus_ineq_dim] = block_row
-
-        for i in range(H):
-            block_row = torch.zeros(self.line_state_dim, self.z_dim)
-            line_state_idx = i * self.line_state_dim + self.line_state_start_idx
-            line_max_slack_idx = i * self.line_max_slack_dim + self.line_max_slack_start_idx
-
-            block_row[:,line_state_idx:line_state_idx+self.line_state_dim] = torch.eye(self.line_state_dim)
-            block_row[:,line_max_slack_idx:line_max_slack_idx+self.line_state_dim] = -torch.eye(self.line_max_slack_dim)
-
-            row_idx = i * self.line_state_dim + H * self.bus_ineq_dim
-            self.G[row_idx:row_idx+self.line_state_dim] = block_row
-
-        for i in range(H):
-            block_row = torch.zeros(self.line_state_dim, self.z_dim)
-            line_state_idx = i * self.line_state_dim + self.line_state_start_idx
-            line_min_slack_idx = i * self.line_min_slack_dim + self.line_min_slack_start_idx
-
-            block_row[:,line_state_idx:line_state_idx+self.line_state_dim] = -torch.eye(self.line_state_dim)
-            block_row[:,line_min_slack_idx:line_min_slack_idx+self.line_state_dim] = -torch.eye(self.line_min_slack_dim)
-
-            row_idx = i * self.line_state_dim + H * (self.bus_ineq_dim + self.line_state_dim)
-            self.G[row_idx:row_idx+self.line_state_dim] = block_row
-        # ----------------------------------------
-        # self.nBatch = 1
-        # Q_, _ = qpth.util.expandParam(self.Q, self.nBatch, 3)
-        # G_, _ = qpth.util.expandParam(self.G, self.nBatch, 3)
-        # A_, _ = qpth.util.expandParam(self.A, self.nBatch, 3)
-        # ------------ Construct scaling matrices ------------
-        scale_vec = torch.zeros(self.z_dim)
-        # bus states
-        for i in range(H):
-            # battery charge 
-            idx = i * self.bus_state_dim
-            scale_vec[idx:idx+self.num_batt] = self.grid.target_batt_charges[self.batt_idx]
-
-            # battery power injection
-            idx = i * self.bus_state_dim + self.num_batt
-            scale_vec[idx:idx+self.num_batt] = self.grid.batt_power_max_limits[self.batt_idx]
-
-            # curtailment
-            idx = i * self.bus_state_dim + 2 * self.num_batt
-            scale_vec[idx:idx+self.num_curt] = self.grid.curt_max_limits[self.curt_idx]
-
-        # line state
-        for i in range(H):
-            idx = self.line_state_start_idx + i * self.line_state_dim
-            scale_vec[idx:idx+self.line_state_dim] = self.grid.line_data[:,5]
-
-        # line max slack
-        for i in range(H):
-            idx = self.line_max_slack_start_idx + i * self.line_max_slack_dim
-            scale_vec[idx:idx+self.line_max_slack_dim] = self.grid.line_data[:,5]
-        self.line_max_slack_scale_vec = self.grid.line_data[:,5]
-
-        # line min slack
-        for i in range(H):
-            idx = self.line_min_slack_start_idx + i * self.line_min_slack_dim
-            scale_vec[idx:idx+self.line_min_slack_dim] = self.grid.line_data[:,5]
-        self.line_min_slack_scale_vec = self.grid.line_data[:,5]
-
-        # batt action
-        for i in range(H):
-            idx = self.action_batt_start_idx + i * self.num_batt
-            scale_vec[idx:idx+self.num_batt] = self.grid.batt_power_max_limits[self.batt_idx]
-
-        # curt action
-        for i in range(H):
-            idx = self.action_curt_start_idx + i * self.num_curt
-            scale_vec[idx:idx+self.num_curt] = self.grid.curt_max_limits[self.curt_idx]
-
-        self.scale_vec = scale_vec
-
-        # D = diag(scale_vec)
-        AD = torch.mul(self.A, scale_vec)
-        E_vec = torch.zeros(self.eq_dim)
-        eps = 1e-6
-        for i in range(self.eq_dim):
-            E_vec[i] = 1 / (torch.linalg.norm(AD[i]) + eps)
-        
-        GD = torch.mul(self.G, scale_vec)
-        F_vec = torch.zeros(self.ineq_dim)
-        eps = 1e-6
-        for i in range(self.ineq_dim):
-            F_vec[i] = 1 / (torch.linalg.norm(GD[i]) + eps)
-        
-        self.E_vec = E_vec
-        self.F_vec = F_vec
-        raw_q = 2 * scale_vec * true_cost_vec * scale_vec
-
-        scale_denom = self._qp_cost_scale_denom(raw_q)
-        ridge_eps = 1e-8 * scale_denom
-
-        q_vec = (raw_q + ridge_eps) / scale_denom
-        inv_scale = 1.0 / scale_denom
-        self.q = -2 * true_cost_vec * target_vec * inv_scale
-        self.const = torch.sum(true_cost_vec * target_vec ** 2 * inv_scale)
-        
-        self.q_vec = q_vec
-        self.scaled_Q = torch.diag(q_vec)
-        
-        self.scaled_q = scale_vec * self.q 
-    
-        self.scaled_A = E_vec.unsqueeze(-1) * AD
-        self.scaled_G = F_vec.unsqueeze(-1) * GD
-        self.nBatch = 1
-        Q_, _ = qpth.util.expandParam(self.scaled_Q, self.nBatch, 3)
-        G_, _ = qpth.util.expandParam(self.scaled_G, self.nBatch, 3)
-        A_, _ = qpth.util.expandParam(self.scaled_A, self.nBatch, 3)
-        self.csc_scaled_Q = self.scaled_Q.to_sparse_csc()
-        self.csc_scaled_G = self.scaled_G.to_sparse_csc()
-        self.csc_scaled_A = self.scaled_A.to_sparse_csc()
-        self.scipy_scaled_Q = csc_torch_to_scipy(self.csc_scaled_Q)
-        self.scipy_scaled_G = csc_torch_to_scipy(self.csc_scaled_G)
-        self.scipy_scaled_A = csc_torch_to_scipy(self.csc_scaled_A)
-
-
-    def _apply_cost_linear_terms(self, target_vec):
-        """Recompute q/const/scaled_q from current deviation targets."""
-        true_cost_vec = self.true_cost_vec
-        raw_q = 2 * self.scale_vec * true_cost_vec * self.scale_vec
-        scale_denom = self._qp_cost_scale_denom(raw_q)
-        inv_scale = 1.0 / scale_denom
-        self.q = -2 * true_cost_vec * target_vec * inv_scale
-        self.const = torch.sum(true_cost_vec * target_vec ** 2 * inv_scale)
-        self.scaled_q = self.scale_vec * self.q
+        self.init_matrices()
 
 
     def update_line_state(self):
@@ -1069,64 +935,6 @@ class Split_Constraint_Controller(Base_Controller):
         """
         self.line_max_change = nn.Parameter(self.init_line_max_change_buf.clone())
         self.line_min_change = nn.Parameter(self.init_line_min_change_buf.clone())
-
-
-    def interpret_z(self, z, update_state=False):
-        norm_squared = torch.sum(z**2)
-        z *= self.scale_vec
-        bus_states = torch.zeros(self.H, self.bus_state_dim)
-        for i in range(self.H):
-            bus_states[i] = z[i*self.bus_state_dim:(i+1)*self.bus_state_dim]
-
-        line_states = torch.zeros(self.H, self.line_state_dim)
-        for i in range(self.H):
-            line_states[i] = z[i*self.line_state_dim+self.line_state_start_idx:(i+1)*self.line_state_dim+self.line_state_start_idx]
-
-        actions_curt = torch.zeros(self.H, self.num_curt)
-        for i in range(self.H):
-            actions_curt[i] = z[i*self.num_curt+self.action_curt_start_idx:(i+1)*self.num_curt+self.action_curt_start_idx]
-
-        actions_batt = torch.zeros(self.H, self.num_batt)
-        for i in range(self.H):
-            actions_batt[i] = z[i*self.num_batt+self.action_batt_start_idx:(i+1)*self.num_batt+self.action_batt_start_idx]
-
-        line_max_slacks = torch.zeros(self.H, self.line_max_slack_dim)
-        for i in range(self.H):
-            line_max_slacks[i] = z[i*self.line_max_slack_dim+self.line_max_slack_start_idx:(i+1)*self.line_max_slack_dim+self.line_max_slack_start_idx]
-
-        line_min_slacks = torch.zeros(self.H, self.line_min_slack_dim)
-        for i in range(self.H):
-            line_min_slacks[i] = z[i*self.line_min_slack_dim+self.line_min_slack_start_idx:(i+1)*self.line_min_slack_dim+self.line_min_slack_start_idx]
-
-        self.target_charges = self.grid.target_batt_charges[self.batt_idx]
-        objective = 0
-        batt_obj = 0
-        curt_change_obj = 0
-        curt_net_obj = 0
-        with torch.no_grad():
-            for i in range(self.H):
-                # print(actions_curt[i])
-                objective += self.batt_cost * torch.sum((bus_states[i][self.bus_state_batt_charge_idx] - self.target_charges)**2)
-                batt_obj += self.batt_cost * torch.sum((bus_states[i][self.bus_state_batt_charge_idx] - self.target_charges)**2)
-                objective += self.curt_change_cost * torch.sum(actions_curt[i]**2)
-                curt_change_obj += self.curt_change_cost * torch.sum(actions_curt[i]**2)
-                objective += self.curt_net_cost * torch.sum(bus_states[i][self.bus_state_curt_idx]**2)
-                curt_net_obj += self.curt_net_cost * torch.sum(bus_states[i][self.bus_state_curt_idx]**2)
-                objective += self.line_slack_cost * torch.sum(line_max_slacks[i]**2)
-                objective += self.line_slack_cost * torch.sum(line_min_slacks[i]**2)
-            if self.line_terminal_cost > 0:
-                terminal_line = line_states[self.H - 1]
-                objective += self.line_terminal_cost * torch.sum(
-                    (terminal_line - self.initial_line_flows) ** 2
-                )
-            objective += self.mpc_terminal_batt_curt_cost(bus_states)
-            objective += self.eps * torch.sum(norm_squared ** 2)
-
-        if update_state:
-            self.bus_state = bus_states[0]
-            self.line_state = line_states[0]
-
-        return bus_states, line_states, actions_curt, actions_batt, None, line_max_slacks, line_min_slacks, objective
 
 
     def get_matrices_dQPTH(self, disturbances, t):
