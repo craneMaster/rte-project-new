@@ -174,7 +174,7 @@ def test_normalization():
     return
 
 
-def get_RTE_noise_values(file_path, grid, T, H, power_scale, bus_idx_gap, offset=0):
+def get_RTE_noise_values(file_path, grid, T, H, power_scale, bus_idx_gap, offset=0, noise_length=None):
     """
     Generates a series of disturbance values over a collection of buses based on a set of power injection disturbances
     from an open-source RTE data source.
@@ -197,30 +197,38 @@ def get_RTE_noise_values(file_path, grid, T, H, power_scale, bus_idx_gap, offset
             File location of RTE noise values.
         offset (int):
             Amount to shift entire trajectory of disturbance values.
+        noise_length (int, optional):
+            Number of timesteps to extract. Defaults to ``T + H`` (single-cycle length).
+            When longer than ``T + H`` (multi-cycle), the series is still normalized by the
+            mean absolute value of the first ``T + H`` rows so cycle-1 scale matches a
+            single-cycle extract of the same offset.
     Returns:
-        noise_values (Numpy array of size (T+H, num_buses)):
+        noise_values (Numpy array of size (noise_length, num_buses)):
             A series of disturbance values.
     """
     data = np.loadtxt(file_path)
     vec = torch.tensor(data)
-    disturbance_length = T + H
+    cycle_length = T + H
+    disturbance_length = noise_length if noise_length is not None else cycle_length
     all_disturbances = torch.zeros(disturbance_length, grid.num_buses)
 
     for i in range(grid.num_curt):
         bus = grid.bus_with_curt[i]
         bus_max_gen = grid.curt_max_limits[i]
         start_idx = offset + bus * bus_idx_gap
-        idx = torch.arange(start_idx, start_idx + grid.delta_t*(disturbance_length+1), grid.delta_t, dtype=torch.long)
-
-        if start_idx + grid.delta_t*(disturbance_length+1) >= vec.shape[0]:
-            raise ValueError("Offset / bus gap is too large, index overflow occurred.")
+        idx = torch.arange(
+            start_idx, start_idx + grid.delta_t * (disturbance_length + 1), grid.delta_t, dtype=torch.long)
+        idx = idx % vec.shape[0]
 
         bus_power = bus_max_gen * vec[idx]
         bus_disturbances = torch.diff(bus_power)
         all_disturbances[:,bus] = bus_disturbances
     
-    # normalize
-    all_disturbances = power_scale * (all_disturbances / torch.mean(torch.abs(all_disturbances)))
+    # Normalize by the single-cycle window so multi-cycle extracts keep cycle-1 identical
+    # to get_RTE_noise_values(..., noise_length=T+H) for the same offset.
+    ref_len = min(cycle_length, disturbance_length)
+    scale = torch.mean(torch.abs(all_disturbances[:ref_len]))
+    all_disturbances = power_scale * (all_disturbances / scale)
 
     return all_disturbances
 
@@ -249,7 +257,8 @@ def get_iid_noise_values(T, H, num_buses, max_noise, max_trend=0):
     return trend_values + noise_values
 
 
-def create_base_controllers(grid, num_controllers, partition, T, H, batt_cost, curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost):
+def create_base_controllers(grid, num_controllers, partition, T, H, batt_cost, curt_change_cost, curt_net_cost,
+                            bus_slack_cost, line_slack_cost, soft_bus_constraints=False):
     """
     Initializes base controller agents on a given grid given a desired partition of buses.
 
@@ -272,6 +281,10 @@ def create_base_controllers(grid, num_controllers, partition, T, H, batt_cost, c
             Cost of net amount of power curtailed at a bus. Must be non-negative.
         slack_cost (Double):
             Slack penalty. Must be non-negative.
+        soft_bus_constraints (bool):
+            If True, bus limits are soft (penalty) constraints. Required for multi-cycle
+            handoffs with ``control_delay > 0``, where hard bus limits plus committed
+            delay actions can make the QP literally infeasible.
     Returns:
         controller_list: (list of Base_Controller objects) agents fully initialized, in the order matching the partition
     Raises:
@@ -291,14 +304,16 @@ def create_base_controllers(grid, num_controllers, partition, T, H, batt_cost, c
     controller_list = list()
     for i in range(num_controllers):
         buses_in_area = torch.tensor(partition[i], dtype=torch.int)
-        controller_list.append(controller_pkg.Base_Controller(grid, H, buses_in_area, batt_cost, curt_change_cost, curt_net_cost,
-                                        bus_slack_cost, line_slack_cost))
+        controller_list.append(controller_pkg.Base_Controller(
+            grid, H, buses_in_area, batt_cost, curt_change_cost, curt_net_cost,
+            bus_slack_cost, line_slack_cost, soft_bus_constraints=soft_bus_constraints))
         
     return controller_list
 
 
 def create_split_constraint_controllers(grid, num_controllers, partition, T, H, batt_cost, curt_change_cost, curt_net_cost,
-                                  bus_slack_cost, line_slack_cost, line_terminal_cost=0.0, batt_curt_terminal_cost=0.0):
+                                  bus_slack_cost, line_slack_cost, line_terminal_cost=0.0, batt_curt_terminal_cost=0.0,
+                                  soft_bus_constraints=False):
     """
     Initializes split constraint agents on a given grid given a desired partition of buses.
 
@@ -357,7 +372,8 @@ def create_split_constraint_controllers(grid, num_controllers, partition, T, H, 
         controller_list.append(controller_pkg.Split_Constraint_Controller(grid, H, buses_in_area, max_margin, min_margin, batt_cost,
                                                     curt_change_cost, curt_net_cost, bus_slack_cost, line_slack_cost,
                                                     line_terminal_cost=line_terminal_cost,
-                                                    batt_curt_terminal_cost=batt_curt_terminal_cost))
+                                                    batt_curt_terminal_cost=batt_curt_terminal_cost,
+                                                    soft_bus_constraints=soft_bus_constraints))
     return controller_list
 
 
@@ -566,6 +582,10 @@ def get_next_action_base(grid, controller_list, disturbances, t, dQPTH_layer, ve
     except Exception as e:
         print("Following error occurred when calling dQPTH_layer:")
         print(e)
+        # Drop stale bases (e.g. split vs base QP layout mismatch) and rethrow so
+        # callers don't continue with undefined results / zero actions.
+        dQPTH_layer.clear_cache()
+        raise
     try:
         for i in range(num_agents):
             controller = controller_list[i]
