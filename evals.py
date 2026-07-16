@@ -1293,14 +1293,15 @@ def train_with_rollout(grid, T, H, all_train_traj, batt_cost, curt_change_cost, 
         if cycle == 0:
             param_groups = [{'params': [controller.line_max_change, controller.line_min_change]} for controller in controller_dqp_list]
             optimizer = _make_optimizer(param_groups, optimizer_type, lr)
-        else:
-            # Plateau decays carry across cycles otherwise; restore the configured lr each cycle.
-            for group in optimizer.param_groups:
-                group["lr"] = lr
+        # Plateau/step decays must not carry into the next cycle; restore the configured lr.
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+            group["initial_lr"] = lr
         scheduler = _make_scheduler(optimizer, lr_schedule, schedule_kwargs, epochs * steps_per_epoch)
 
         print(
-            f"Starting training cycle {cycle + 1}/{num_cycles} ({epochs} epochs, lr={lr})",
+            f"Starting training cycle {cycle + 1}/{num_cycles} "
+            f"({epochs} epochs, lr={optimizer.param_groups[0]['lr']})",
             flush=True)
         for epoch in tqdm(range(epochs), desc=f"cycle {cycle + 1}/{num_cycles}"):
             epoch_total_loss = 0
